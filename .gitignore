@@ -1,0 +1,9 @@
+.env
+bin/
+storage/
+docs/docs.go
+docs/swagger.*
+*.test
+.idea/
+.vscode/
+.history/
