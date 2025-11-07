@@ -2,6 +2,7 @@
 
 -- Base schema: users table. Roles are a plain string column on users;
 -- add a roles/permissions model later only if you outgrow that.
+-- auth_version revokes JWTs on privilege change (tokens carry aver).
 -- IDs are UUID strings (CHAR(36)); the app sets them in BeforeCreate.
 -- Add your domain tables in a new timestamped migration via
 -- `ginplate make:migration <Name>`.
@@ -13,6 +14,7 @@ CREATE TABLE IF NOT EXISTS users (
   password_hash VARCHAR(255) NOT NULL,
   role VARCHAR(32) NOT NULL DEFAULT 'member',
   is_active TINYINT(1) NOT NULL DEFAULT 1,
+  auth_version INT NOT NULL DEFAULT 1,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
   UNIQUE KEY uq_users_email (email)
