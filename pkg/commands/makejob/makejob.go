@@ -1,0 +1,281 @@
+package makejob
+
+import (
+	"fmt"
+	"go/format"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"text/template"
+
+	"github.com/spf13/cobra"
+)
+
+// NewMakeJobCmd builds the `make:job` generator:
+// `ginplate make:job Billing.Charge` writes internal/jobs/billing_charge.go
+// containing a queue handler stub that self-registers via init(). With
+// --schedule the same file also registers a scheduler entry, so the job is
+// fully wired after the next build — no manual edits.
+func NewMakeJobCmd() *cobra.Command {
+	var dir, sched string
+	var force, dryRun bool
+	cmd := &cobra.Command{
+		Use:   "make:job <Name>",
+		Short: "Generate a new queue job handler (auto-registered)",
+		Long: `Generate a job handler stub in internal/jobs, e.g.:
+
+	ginplate make:job Billing.Charge                 # internal/jobs/billing_charge.go, job "billing.charge"
+	ginplate make:job ChargeInvoice                  # internal/jobs/charge_invoice.go, job "charge-invoice"
+	ginplate make:job Billing.Charge --schedule=daily@02:00
+
+The stub registers its handler via init(), so after rebuilding it is
+runnable via the queue (` + "`queue:work`" + ` picks it up by name) with no further
+edits. With --schedule the file also registers a scheduler entry, so
+` + "`schedule:work`" + ` pushes it on cadence. Schedules: every-minute,
+hourly, daily@HH:MM, weekly@Mon@HH:MM, cron:<5-field expr>.`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return generateJob(cmd, dir, args[0], sched, force, dryRun)
+		},
+	}
+	cmd.Flags().StringVar(&dir, "dir", "internal/jobs", "Parent directory for generated job files (module-relative, run from repo root)")
+	cmd.Flags().StringVar(&sched, "schedule", "", "Also register a schedule entry: every-minute|hourly|daily@HH:MM|weekly@Day@HH:MM|cron:<expr>")
+	cmd.Flags().BoolVar(&force, "force", false, "Overwrite the file if it already exists")
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Print the file instead of writing it")
+	return cmd
+}
+
+// jobNames holds the derived identifiers for a generated job.
+type jobNames struct {
+	Name      string // e.g. billing.charge (queue job name)
+	File      string // e.g. billing_charge.go
+	Func      string // e.g. BillingCharge (handler func)
+	Payload   string // e.g. BillingChargePayload
+	Module    string // e.g. github.com/idehen-divine/GinPlate (from go.mod)
+	Schedule  string // e.g. daily@02:00 (empty = handler only)
+	SchedCall string // e.g. .DailyAt(2, 0) (rendered builder chain)
+	NeedsTime bool   // SchedCall references time.Weekday
+}
+
+var validJobNameRe = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9._-]*$`)
+
+// deriveJobNames maps a user-supplied name (ChargeInvoice, charge-invoice,
+// charge_invoice, billing.charge) to file, func, and job identifiers,
+// mirroring make:command's flexible input handling.
+func deriveJobNames(raw string) (jobNames, error) {
+	raw = strings.TrimSpace(raw)
+	if !validJobNameRe.MatchString(raw) {
+		return jobNames{}, fmt.Errorf("invalid name %q: use letters, digits, '.', '-' or '_' (start with a letter)", raw)
+	}
+	var words []string
+	for _, seg := range strings.Split(raw, ".") {
+		if seg == "" {
+			return jobNames{}, fmt.Errorf("invalid name %q: empty segment", raw)
+		}
+		for _, part := range strings.FieldsFunc(seg, func(r rune) bool { return r == '-' || r == '_' || r == ' ' }) {
+			words = append(words, splitCamel(part)...)
+		}
+	}
+	lower := make([]string, len(words))
+	studly := ""
+	for i, w := range words {
+		lower[i] = strings.ToLower(w)
+		studly += capitalize(w)
+	}
+	name := strings.Join(lower, "-")
+	if strings.Contains(raw, ".") {
+		segs := strings.Split(raw, ".")
+		for i, s := range segs {
+			segs[i] = kebab(s)
+		}
+		name = strings.Join(segs, ".")
+	}
+	return jobNames{
+		Name:    name,
+		File:    strings.Join(lower, "_") + ".go",
+		Func:    studly,
+		Payload: studly + "Payload",
+	}, nil
+}
+
+// kebab lowercases one dot-segment, splitting Studly humps.
+func kebab(s string) string {
+	var words []string
+	for _, part := range strings.FieldsFunc(s, func(r rune) bool { return r == '-' || r == '_' || r == ' ' }) {
+		words = append(words, splitCamel(part)...)
+	}
+	lower := make([]string, len(words))
+	for i, w := range words {
+		lower[i] = strings.ToLower(w)
+	}
+	return strings.Join(lower, "-")
+}
+
+// splitCamel splits "SendEmails" into ["Send" "Emails"].
+func splitCamel(s string) []string {
+	var words []string
+	start := 0
+	for i := 1; i < len(s); i++ {
+		c, p := s[i], s[i-1]
+		if c >= 'A' && c <= 'Z' && ((p >= 'a' && p <= 'z') || (p >= '0' && p <= '9')) {
+			words = append(words, s[start:i])
+			start = i
+		}
+	}
+	return append(words, s[start:])
+}
+
+// capitalize uppercases the first letter and lowercases the rest, turning a
+// word into its StudlyCase segment.
+func capitalize(s string) string {
+	if s == "" {
+		return s
+	}
+	return strings.ToUpper(s[:1]) + strings.ToLower(s[1:])
+}
+
+var jobTemplate = template.Must(template.New("job").Parse(`package jobs
+
+import (
+	"context"
+	"encoding/json"
+{{if .NeedsTime}}	"time"
+{{end}}
+	"{{.Module}}/pkg/queue"
+	{{if .Schedule}}"{{.Module}}/pkg/scheduler"{{end}}
+)
+
+func init() {
+	queue.Handle("{{.Name}}", {{.Func}})
+	{{if .Schedule}}scheduler.Schedule(scheduler.New("{{.Name}}").WithPayload([]byte(` + "`{}`" + `)){{.SchedCall}}){{end}}
+}
+
+// {{.Payload}} is the JSON body pushed for "{{.Name}}". Add fields as the
+// job needs them.
+type {{.Payload}} struct {
+	// TODO: fields, e.g. ID string ` + "`json:\"id\"`" + `
+}
+
+// {{.Func}} was generated by ` + "`ginplate make:job`" + `.
+func {{.Func}}(ctx context.Context, job queue.Job) error {
+	var payload {{.Payload}}
+	if err := json.Unmarshal({{if .Schedule}}scheduler.Data(job.Payload){{else}}job.Payload{{end}}, &payload); err != nil {
+		return err
+	}
+	// TODO: your logic here.
+	return nil
+}
+`))
+
+// renderJob renders the stub source, gofmt-formatted.
+func renderJob(n jobNames) ([]byte, error) {
+	var sb strings.Builder
+	if err := jobTemplate.Execute(&sb, n); err != nil {
+		return nil, err
+	}
+	return format.Source([]byte(sb.String()))
+}
+
+// parseSchedule maps the --schedule flag to a scheduler builder chain, e.g.
+// "daily@02:00" to `.DailyAt(2, 0)`, validating shape and ranges.
+func parseSchedule(flag string) (string, error) {
+	if strings.HasPrefix(flag, "cron:") {
+		expr := strings.TrimSpace(strings.TrimPrefix(flag, "cron:"))
+		if len(strings.Fields(expr)) != 5 {
+			return "", fmt.Errorf("cron schedule needs a 5-field expression, got %q", expr)
+		}
+		return fmt.Sprintf(`.Cron(%q)`, expr), nil
+	}
+	switch {
+	case flag == "every-minute":
+		return ".EveryMinute()", nil
+	case flag == "hourly":
+		return ".Hourly()", nil
+	case strings.HasPrefix(flag, "daily@"):
+		var h, m int
+		if _, err := fmt.Sscanf(strings.TrimPrefix(flag, "daily@"), "%d:%d", &h, &m); err != nil || h < 0 || h > 23 || m < 0 || m > 59 {
+			return "", fmt.Errorf("daily schedule needs daily@HH:MM (00:00-23:59), got %q", flag)
+		}
+		return fmt.Sprintf(".DailyAt(%d, %d)", h, m), nil
+	case strings.HasPrefix(flag, "weekly@"):
+		parts := strings.SplitN(strings.TrimPrefix(flag, "weekly@"), "@", 2)
+		if len(parts) != 2 {
+			return "", fmt.Errorf("weekly schedule needs weekly@Day@HH:MM, got %q", flag)
+		}
+		day := parts[0]
+		var h, m int
+		if _, err := fmt.Sscanf(parts[1], "%d:%d", &h, &m); err != nil {
+			return "", fmt.Errorf("weekly schedule needs weekly@Day@HH:MM, got %q", flag)
+		}
+		days := map[string]string{"sun": "time.Sunday", "mon": "time.Monday", "tue": "time.Tuesday", "wed": "time.Wednesday", "thu": "time.Thursday", "fri": "time.Friday", "sat": "time.Saturday"}
+		d, ok := days[strings.ToLower(day)]
+		if !ok || h < 0 || h > 23 || m < 0 || m > 59 {
+			return "", fmt.Errorf("weekly schedule needs weekly@Day@HH:MM with Day Sun-Sat, got %q", flag)
+		}
+		return fmt.Sprintf(".Weekly(%s, %d, %d)", d, h, m), nil
+	default:
+		return "", fmt.Errorf("unknown schedule %q: every-minute|hourly|daily@HH:MM|weekly@Day@HH:MM|cron:<expr>", flag)
+	}
+}
+
+// modulePath reads the module path from go.mod in the working directory,
+// so generated import paths survive a cloner renaming the module.
+func modulePath() (string, error) {
+	data, err := os.ReadFile("go.mod")
+	if err != nil {
+		return "", fmt.Errorf("read go.mod (run from repo root): %w", err)
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if mod, ok := strings.CutPrefix(strings.TrimSpace(line), "module "); ok {
+			if mod = strings.TrimSpace(mod); mod != "" {
+				return mod, nil
+			}
+		}
+	}
+	return "", fmt.Errorf("no module line in go.mod")
+}
+
+// generateJob validates the name, renders the stub, and writes it into
+// --dir. Same-package files need no import sync: package jobs compiles the
+// new file (and its init()) automatically. Dry-run prints instead.
+func generateJob(cmd *cobra.Command, dir, raw, sched string, force, dryRun bool) error {
+	n, err := deriveJobNames(raw)
+	if err != nil {
+		return err
+	}
+	module, err := modulePath()
+	if err != nil {
+		return err
+	}
+	n.Module = module
+	if sched != "" {
+		call, err := parseSchedule(sched)
+		if err != nil {
+			return err
+		}
+		n.Schedule = sched
+		n.SchedCall = call
+		n.NeedsTime = strings.Contains(call, "time.")
+	}
+	src, err := renderJob(n)
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(dir, n.File)
+	if dryRun {
+		cmd.Println(string(src))
+		return nil
+	}
+	if _, err := os.Stat(path); err == nil && !force {
+		return fmt.Errorf("file %s already exists (use --force to overwrite)", path)
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(path, src, 0o644); err != nil {
+		return err
+	}
+	cmd.Printf("created %s\n", path)
+	return nil
+}
