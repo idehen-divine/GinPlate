@@ -73,6 +73,49 @@ func conformance(t *testing.T, name string, open func(t *testing.T) Store) {
 			t.Fatalf("overwrite access = %q,%v", rjti, ok)
 		}
 	})
+
+	t.Run(name+"/consume-single-use", func(t *testing.T) {
+		s := open(t)
+		if err := s.Link(ctx, "a4", "r4", "u4", time.Minute, time.Hour); err != nil {
+			t.Fatal(err)
+		}
+		ajti, ok, err := s.ConsumeRefresh(ctx, "r4")
+		if err != nil || !ok || ajti != "a4" {
+			t.Fatalf("consume = %q,%v,%v", ajti, ok, err)
+		}
+		if _, ok, _ := s.ConsumeRefresh(ctx, "r4"); ok {
+			t.Fatal("replay consumed twice")
+		}
+		if _, ok := s.AccessValid(ctx, "a4"); ok {
+			t.Fatal("access half survived consume")
+		}
+		if _, ok := s.RefreshValid(ctx, "r4"); ok {
+			t.Fatal("refresh half survived consume")
+		}
+	})
+
+	t.Run(name+"/replace-single-use", func(t *testing.T) {
+		s := open(t)
+		if err := s.Link(ctx, "a5", "r5", "u5", time.Minute, time.Hour); err != nil {
+			t.Fatal(err)
+		}
+		old, ok, err := s.ReplaceRefresh(ctx, "r5", "a6", "r6", "u5", time.Minute, time.Hour)
+		if err != nil || !ok || old != "a5" {
+			t.Fatalf("replace = %q,%v,%v", old, ok, err)
+		}
+		if _, ok := s.AccessValid(ctx, "a5"); ok {
+			t.Fatal("old access half survived replacement")
+		}
+		if _, ok := s.RefreshValid(ctx, "r5"); ok {
+			t.Fatal("old refresh half survived replacement")
+		}
+		if got, ok := s.RefreshValid(ctx, "r6"); !ok || got != "a6" {
+			t.Fatalf("replacement halves = %q,%v", got, ok)
+		}
+		if _, ok, _ := s.ReplaceRefresh(ctx, "r5", "a7", "r7", "u5", time.Minute, time.Hour); ok {
+			t.Fatal("replay replaced twice")
+		}
+	})
 }
 
 // TestSession is the single entry point for every session test: redis and
@@ -170,8 +213,8 @@ func TestSession(t *testing.T) {
 		if _, err := Open("bogus", nil, nil, ""); err == nil {
 			t.Fatal("expected error for unknown driver")
 		}
-		if s, err := Open("redis", nil, nil, ""); err != nil || s != nil {
-			t.Fatalf("redis without client should degrade to nil store: %v", err)
+		if s, err := Open("redis", nil, nil, ""); err == nil || s != nil {
+			t.Fatalf("redis without client must fail, got store=%v err=%v", s, err)
 		}
 		if _, err := Open("redis", nil, rdb, ""); err != nil {
 			t.Fatalf("redis with client: %v", err)

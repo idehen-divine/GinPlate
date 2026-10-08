@@ -2,9 +2,11 @@ package session
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // sessionRow maps the sessions migration table. The id holds the access
@@ -34,6 +36,9 @@ func Database(db *gorm.DB) Store {
 
 // Link inserts (or replaces) the session row with absolute expiries.
 func (s *databaseStore) Link(ctx context.Context, accessJti, refreshJti, userID string, accessTTL, refreshTTL time.Duration) error {
+	if accessJti == "" || refreshJti == "" {
+		return errEmptySessionID
+	}
 	now := s.now()
 	row := sessionRow{
 		ID:               accessJti,
@@ -80,6 +85,110 @@ func (s *databaseStore) RefreshValid(ctx context.Context, refreshJti string) (st
 		return "", false
 	}
 	return row.ID, true
+}
+
+// ReplaceRefresh validates the old refresh half and records the
+// replacement session in one transaction: row lock, old-row deletion
+// (RowsAffected must be 1, else a concurrent rotation won), then new-row
+// insertion. Any failure rolls the transaction back, so the old session
+// survives storage errors and the user can retry instead of being stranded
+// without a session.
+func (s *databaseStore) ReplaceRefresh(ctx context.Context, oldRefreshJti, newAccessJti, newRefreshJti, userID string, accessTTL, refreshTTL time.Duration) (string, bool, error) {
+	if oldRefreshJti == "" || newAccessJti == "" || newRefreshJti == "" {
+		return "", false, errEmptySessionID
+	}
+	now := s.now()
+	var oldAccessJti string
+	var replaced bool
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var row sessionRow
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("refresh_jti = ?", oldRefreshJti).First(&row).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil // replay or unknown: ok=false, no error
+			}
+			return err
+		}
+		if !now.Before(row.RefreshExpiresAt) {
+			res := tx.Where("refresh_jti = ?", oldRefreshJti).Delete(&sessionRow{})
+			if res.Error != nil {
+				return res.Error
+			}
+			return nil // expired: reaped, replay either way
+		}
+		res := tx.Where("refresh_jti = ?", oldRefreshJti).Delete(&sessionRow{})
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return nil // racer already consumed it: replay
+		}
+		next := sessionRow{
+			ID:               newAccessJti,
+			RefreshJTI:       newRefreshJti,
+			UserID:           userID,
+			AccessExpiresAt:  now.Add(accessTTL),
+			RefreshExpiresAt: now.Add(refreshTTL),
+		}
+		if err := tx.Create(&next).Error; err != nil {
+			return err // rolls back the deletion: old session survives
+		}
+		oldAccessJti = row.ID
+		replaced = true
+		return nil
+	})
+	if err != nil {
+		return "", false, err
+	}
+	return oldAccessJti, replaced, nil
+}
+
+// ConsumeRefresh validates the refresh half and deletes the session row in
+// one transaction, so concurrent refresh requests cannot both succeed. The
+// row is locked with SELECT ... FOR UPDATE and the DELETE must affect
+// exactly one row: RowsAffected == 0 means a concurrent consumer already
+// deleted it, which is reported as replay (ok=false), not success.
+// Expired rows are reaped and likewise reported as replay.
+func (s *databaseStore) ConsumeRefresh(ctx context.Context, refreshJti string) (string, bool, error) {
+	if refreshJti == "" {
+		return "", false, nil
+	}
+	var accessJti string
+	var consumed bool
+	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var row sessionRow
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("refresh_jti = ?", refreshJti).First(&row).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil // replay or unknown: ok=false, no error
+			}
+			return err
+		}
+		if !s.now().Before(row.RefreshExpiresAt) {
+			res := tx.Where("refresh_jti = ?", refreshJti).Delete(&sessionRow{})
+			if res.Error != nil {
+				return res.Error
+			}
+			if res.RowsAffected == 0 {
+				return nil // racer already reaped it: replay
+			}
+			return nil
+		}
+		res := tx.Where("refresh_jti = ?", refreshJti).Delete(&sessionRow{})
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return nil // racer already consumed it: replay
+		}
+		accessJti = row.ID
+		consumed = true
+		return nil
+	})
+	if err != nil {
+		return "", false, err
+	}
+	return accessJti, consumed, nil
 }
 
 // Unlink destroys the session row by either half. Missing rows are not errors.

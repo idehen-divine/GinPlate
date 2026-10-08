@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -23,19 +24,23 @@ type fileSession struct {
 
 // fileStore is a Store backed by one JSON file per session. Reads scan the
 // directory for the refresh half, so this driver suits single-instance dev,
-// not high-traffic fleets.
+// not high-traffic fleets. Development-only: files are 0600 under a 0700
+// directory, and refresh consumes are serialized by mu within one process;
+// the driver does not coordinate across processes or replicas.
 type fileStore struct {
 	dir string
 	now func() time.Time
+	mu  sync.Mutex
 }
 
 // File returns a file-backed Store rooted at dir (created on demand).
-// An empty dir selects DefaultDir.
+// An empty dir selects DefaultDir. Development-only: not suitable for
+// multi-user hosts or multi-instance production (no shared revocation).
 func File(dir string) (Store, error) {
 	if strings.TrimSpace(dir) == "" {
 		dir = DefaultDir
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
 	return &fileStore{dir: dir, now: time.Now}, nil
@@ -61,7 +66,7 @@ func (s *fileStore) Link(_ context.Context, accessJti, refreshJti, userID string
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(s.path(accessJti), raw, 0o644)
+	return os.WriteFile(s.path(accessJti), raw, 0o600)
 }
 
 // read loads and expiry-checks a session file, deleting it when expired.
@@ -128,15 +133,98 @@ func (s *fileStore) RefreshValid(_ context.Context, refreshJti string) (string, 
 }
 
 // Unlink deletes the access file and any file linked to the refresh half.
-// Missing files are not errors.
+// Missing files are not errors; other removal failures are returned.
 func (s *fileStore) Unlink(_ context.Context, accessJti, refreshJti string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if accessJti != "" && !strings.ContainsAny(accessJti, `/\.`) {
-		_ = os.Remove(s.path(accessJti))
+		if err := os.Remove(s.path(accessJti)); err != nil && !os.IsNotExist(err) {
+			return err
+		}
 	}
 	if refreshJti != "" {
-		if accessJti, ok := s.RefreshValid(context.Background(), refreshJti); ok {
-			_ = os.Remove(s.path(accessJti))
+		if accessJti, ok := s.refreshValidLocked(refreshJti); ok {
+			if err := os.Remove(s.path(accessJti)); err != nil && !os.IsNotExist(err) {
+				return err
+			}
 		}
 	}
 	return nil
+}
+
+// ReplaceRefresh validates the old refresh half and records the
+// replacement session in one mutex-guarded step. The old file is consumed
+// first so concurrent callers cannot both succeed; if the replacement write
+// then fails, the rotation reports an error and the user must re-login
+// (fail closed). Single process only; cross-process rotation still needs
+// redis or database.
+func (s *fileStore) ReplaceRefresh(_ context.Context, oldRefreshJti, newAccessJti, newRefreshJti, userID string, accessTTL, refreshTTL time.Duration) (string, bool, error) {
+	if oldRefreshJti == "" || newAccessJti == "" || newRefreshJti == "" {
+		return "", false, errEmptySessionID
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	oldAccessJti, ok := s.refreshValidLocked(oldRefreshJti)
+	if !ok {
+		return "", false, nil
+	}
+	now := s.now()
+	raw, err := json.Marshal(fileSession{
+		RefreshJTI:       newRefreshJti,
+		UserID:           userID,
+		AccessExpiresAt:  now.Add(accessTTL),
+		RefreshExpiresAt: now.Add(refreshTTL),
+	})
+	if err != nil {
+		return "", false, err
+	}
+	if err := os.Remove(s.path(oldAccessJti)); err != nil && !os.IsNotExist(err) {
+		return "", false, err
+	}
+	if err := os.WriteFile(s.path(newAccessJti), raw, 0o600); err != nil {
+		return "", false, err
+	}
+	return oldAccessJti, true, nil
+}
+
+// ConsumeRefresh validates the refresh half and deletes the session in one
+// mutex-guarded step so concurrent callers cannot both succeed. Single
+// process only; cross-process rotation still needs redis or database.
+func (s *fileStore) ConsumeRefresh(_ context.Context, refreshJti string) (string, bool, error) {
+	if refreshJti == "" {
+		return "", false, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	accessJti, ok := s.refreshValidLocked(refreshJti)
+	if !ok {
+		return "", false, nil
+	}
+	if err := os.Remove(s.path(accessJti)); err != nil && !os.IsNotExist(err) {
+		return "", false, err
+	}
+	return accessJti, true, nil
+}
+
+// refreshValidLocked is RefreshValid without locking (caller holds mu).
+func (s *fileStore) refreshValidLocked(refreshJti string) (string, bool) {
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		return "", false
+	}
+	now := s.now()
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		accessJti := strings.TrimSuffix(e.Name(), ".json")
+		fs, ok := s.read(accessJti)
+		if !ok {
+			continue
+		}
+		if fs.RefreshJTI == refreshJti && live(fs, false, now) {
+			return accessJti, true
+		}
+	}
+	return "", false
 }

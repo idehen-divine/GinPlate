@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -8,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -16,6 +18,73 @@ import (
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 )
+
+// stubSessionStore is a hermetic session.Store for middleware tests.
+type stubSessionStore struct {
+	mu       sync.Mutex
+	sessions map[string]string // accessJti -> refreshJti
+	refresh  map[string]string // refreshJti -> accessJti
+}
+
+func newStubSessionStore() *stubSessionStore {
+	return &stubSessionStore{sessions: map[string]string{}, refresh: map[string]string{}}
+}
+
+func (s *stubSessionStore) Link(_ context.Context, accessJti, refreshJti, _ string, _, _ time.Duration) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sessions[accessJti] = refreshJti
+	s.refresh[refreshJti] = accessJti
+	return nil
+}
+
+func (s *stubSessionStore) AccessValid(_ context.Context, accessJti string) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rjti, ok := s.sessions[accessJti]
+	return rjti, ok
+}
+
+func (s *stubSessionStore) RefreshValid(_ context.Context, refreshJti string) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ajti, ok := s.refresh[refreshJti]
+	return ajti, ok
+}
+
+func (s *stubSessionStore) ConsumeRefresh(_ context.Context, refreshJti string) (string, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ajti, ok := s.refresh[refreshJti]
+	if !ok {
+		return "", false, nil
+	}
+	delete(s.refresh, refreshJti)
+	delete(s.sessions, ajti)
+	return ajti, true, nil
+}
+
+func (s *stubSessionStore) Unlink(_ context.Context, accessJti, refreshJti string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.sessions, accessJti)
+	delete(s.refresh, refreshJti)
+	return nil
+}
+
+func (s *stubSessionStore) ReplaceRefresh(_ context.Context, oldRefreshJti, newAccessJti, newRefreshJti, _ string, _, _ time.Duration) (string, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ajti, ok := s.refresh[oldRefreshJti]
+	if !ok {
+		return "", false, nil
+	}
+	delete(s.refresh, oldRefreshJti)
+	delete(s.sessions, ajti)
+	s.sessions[newAccessJti] = newRefreshJti
+	s.refresh[newRefreshJti] = newAccessJti
+	return ajti, true, nil
+}
 
 func testCtx(t *testing.T, method, target string) (*gin.Context, *httptest.ResponseRecorder) {
 	t.Helper()
