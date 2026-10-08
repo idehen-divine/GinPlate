@@ -1,4 +1,4 @@
-.PHONY: help commands run run-dev worker scheduler queue-failed queue-retry queue-forget queue-flush keygen mail-test down up migrate-up migrate-status migrate-rollback migrate-reset migrate-refresh migrate-fresh make-migration make-command make-job make-mail make-notification sync-commands docs swagger test test-coverage fmt vet lint check tidy build build-prod install deps
+.PHONY: help commands run run-dev worker scheduler queue-failed queue-retry queue-forget queue-flush keygen mail-test down up migrate-up migrate-status migrate-rollback migrate-reset migrate-refresh migrate-fresh make-migration make-command make-job make-mail make-notification sync-commands docs swagger test test-race test-coverage fmt vet lint vuln verify check tidy build build-prod docker-build docker-up docker-down docker-logs install deps
 
 help:
 	@echo "Available targets:"
@@ -30,8 +30,14 @@ help:
 	@echo "  docs swagger    - Regenerate Swagger docs into ./docs"
 	@echo "  build           - Build the binary into ./bin"
 	@echo "  build-prod      - Optimized production build into ./bin"
+	@echo "  docker-build    - Build the (optional) Docker image"
+	@echo "  docker-up       - Start the (optional) Docker stack"
+	@echo "  docker-down     - Stop the (optional) Docker stack"
+	@echo "  docker-logs     - Follow (optional) Docker stack logs"
 	@echo "  install         - Install the ginplate binary onto PATH"
 	@echo "  test            - Run tests"
+	@echo "  test-race       - Run tests with the race detector"
+	@echo "  vuln verify     - Vulnerability scan / module verification"
 	@echo "  test-coverage   - Tests + HTML coverage report"
 	@echo "  fmt vet lint    - Format, vet, lint"
 	@echo "  check           - fmt + vet + test"
@@ -127,11 +133,35 @@ build-prod:
 	mkdir -p bin
 	CGO_ENABLED=0 go build -ldflags="-s -w" -o bin/ginplate ./cmd/ginplate
 
+# Docker is optional: native `go run` / `make run` needs no containers.
+# These targets are for users who explicitly pick the Docker path.
+docker-build:
+	docker build -t ginplate:latest .
+
+docker-up:
+	docker compose up --build -d
+	@echo "API: http://localhost:8080  MailHog UI: http://localhost:8025"
+
+docker-down:
+	docker compose down
+
+docker-logs:
+	docker compose logs -f
+
 install:
 	go install ./cmd/ginplate
 
 test:
 	go test ./...
+
+test-race:
+	go test -race ./...
+
+vuln:
+	go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
+verify:
+	go mod verify
 
 test-coverage:
 	go test -cover -coverprofile=coverage.out ./...
@@ -146,7 +176,7 @@ vet:
 lint:
 	golangci-lint run
 
-check: fmt vet test
+check: fmt vet verify test-race
 
 deps:
 	go mod download

@@ -55,6 +55,11 @@ plumbing.
 
 ## Quick Start
 
+Pick one path — native Go or Docker. Docker is optional; nothing in the
+default workflow requires it.
+
+**Option A — native Go (default):**
+
 ```bash
 cp .env.example .env
 go run ./cmd/ginplate key:generate
@@ -62,7 +67,25 @@ go run ./cmd/ginplate migrate up
 go run ./cmd/ginplate serve
 ```
 
-The API starts on `http://localhost:8080` by default.
+The API starts on `http://localhost:8080` by default. You need your own
+MySQL/PostgreSQL and (optionally) Redis running, per `.env`.
+
+**Option B — Docker (opt-in):**
+
+```bash
+cp .env.example .env
+MYSQL_ROOT_PASSWORD="$(openssl rand -hex 16)" MYSQL_PASSWORD="$(openssl rand -hex 16)" make docker-up
+make docker-logs   # follow the stack logs
+make docker-down   # stop everything
+```
+
+Compose has no fallback passwords and refuses to start without
+`MYSQL_ROOT_PASSWORD` and `MYSQL_PASSWORD` — generate fresh ones per
+machine, never commit them.
+
+`docker-compose.yml` is a local-development stack only. Production should
+use managed databases and pass secrets via environment variables, never a
+baked-in `.env` (see `.dockerignore`).
 
 Swagger can be served at `/swagger/index.html` when generated docs are
 available and `ENABLE_SWAGGER=true`.
@@ -100,7 +123,7 @@ Important defaults:
 | `APP_PORT` | `8080` | HTTP server port |
 | `APP_DEBUG` | `false` | Enables detailed error output |
 | `DB_CONNECTION` | `mysql` | `mysql` or `pgsql` |
-| `SESSION_DRIVER` | `redis` | `redis`, `database`, or `file` |
+| `SESSION_DRIVER` | `database` | `redis`, `database`, or `file` |
 | `CACHE_STORE` | `redis` | `redis`, `database`, or `memory` |
 | `QUEUE_CONNECTION` | `sync` | `sync`, `database`, or `redis` |
 | `MAIL_MAILER` | `log` | `log`, `smtp`, or `ses` |
@@ -282,8 +305,10 @@ Run the scheduler loop:
 ginplate schedule:work
 ```
 
-Redis-backed locks are used when Redis is available. Otherwise GinPlate falls
-back to in-process locks, which are suitable for single-instance development.
+Redis-backed locks are required for multi-instance schedulers. If Redis is
+unavailable, GinPlate uses process-local locks; this is suitable only for
+single-instance development and must not be used for distributed production
+scheduling.
 
 ## Mail
 

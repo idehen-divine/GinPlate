@@ -1,0 +1,10 @@
+.env
+.git/
+bin/
+storage/logs/
+coverage.out
+coverage.html
+docs/
+.idea/
+.vscode/
+*.log

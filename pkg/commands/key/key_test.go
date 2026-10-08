@@ -60,6 +60,30 @@ func TestKey(t *testing.T) {
 		}
 	})
 
+	t.Run("write-is-owner-only", func(t *testing.T) {
+		dir := t.TempDir()
+		// Fresh files are created 0600.
+		fresh := filepath.Join(dir, "fresh.env")
+		if err := writeKey(fresh, "base64:abc"); err != nil {
+			t.Fatal(err)
+		}
+		if mode := fileMode(t, fresh); mode != 0o600 {
+			t.Errorf("fresh file mode = %o, want 600", mode)
+		}
+		// Rewriting an existing world-readable file tightens it to 0600
+		// (WriteFile alone would leave the old mode in place).
+		loose := filepath.Join(dir, "loose.env")
+		if err := os.WriteFile(loose, []byte("APP_KEY=\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := writeKey(loose, "base64:abc"); err != nil {
+			t.Fatal(err)
+		}
+		if mode := fileMode(t, loose); mode != 0o600 {
+			t.Errorf("rewritten file mode = %o, want 600", mode)
+		}
+	})
+
 	t.Run("generated-key-decodes-to-32-bytes", func(t *testing.T) {
 		raw := make([]byte, 32)
 		if _, err := rand.Read(raw); err != nil {
@@ -75,4 +99,13 @@ func TestKey(t *testing.T) {
 			t.Fatalf("decoded to %d bytes, want 32", len(decoded))
 		}
 	})
+}
+
+func fileMode(t *testing.T, path string) os.FileMode {
+	t.Helper()
+	st, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return st.Mode().Perm()
 }

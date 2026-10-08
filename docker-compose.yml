@@ -1,0 +1,114 @@
+# ============================================================================
+# LOCAL DEVELOPMENT ONLY — do not apply this file to shared, staging, or
+# production environments. Production must use managed MySQL/Postgres,
+# Redis, and object storage with secrets injected via the environment or a
+# secret manager, never via committed files. All published ports below bind
+# to 127.0.0.1 so nothing listens on LAN/WAN interfaces.
+#
+# Required secrets (no fallbacks — Compose refuses to start without them):
+#   MYSQL_ROOT_PASSWORD=... MYSQL_PASSWORD=... make docker-up
+# or export them first:
+#   export MYSQL_ROOT_PASSWORD="$(openssl rand -hex 16)"
+#   export MYSQL_PASSWORD="$(openssl rand -hex 16)"
+# ============================================================================
+services:
+  api:
+    build: .
+    ports:
+      - "127.0.0.1:8080:8080"
+    env_file:
+      - .env
+    environment:
+      DB_HOST: mysql
+      DB_PASSWORD: ${MYSQL_PASSWORD:?set MYSQL_PASSWORD (no default — see header)}
+      DB_PORT: "3306"
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      MAIL_HOST: mailhog
+      MAIL_PORT: "1025"
+      APP_URL: http://localhost:8080
+      CORS_ALLOWED_ORIGINS: http://localhost:8080
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/livez"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+    volumes:
+      - ginplate-storage:/app/storage
+    restart: unless-stopped
+
+  worker:
+    build: .
+    command: ["queue:work"]
+    env_file:
+      - .env
+    environment:
+      DB_HOST: mysql
+      DB_PASSWORD: ${MYSQL_PASSWORD:?set MYSQL_PASSWORD (no default — see header)}
+      REDIS_HOST: redis
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    volumes:
+      - ginplate-storage:/app/storage
+    restart: unless-stopped
+
+  scheduler:
+    build: .
+    command: ["schedule:work"]
+    env_file:
+      - .env
+    environment:
+      DB_HOST: mysql
+      DB_PASSWORD: ${MYSQL_PASSWORD:?set MYSQL_PASSWORD (no default — see header)}
+      REDIS_HOST: redis
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    volumes:
+      - ginplate-storage:/app/storage
+    restart: unless-stopped
+
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?set MYSQL_ROOT_PASSWORD (no default — see header)}
+      MYSQL_DATABASE: ginplate
+      MYSQL_USER: ginplate
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?set MYSQL_PASSWORD (no default — see header)}
+    ports:
+      - "127.0.0.1:3306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p${MYSQL_ROOT_PASSWORD:?set MYSQL_ROOT_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis-data:/data
+
+  mailhog:
+    image: mailhog/mailhog:v1.0.1
+    ports:
+      - "127.0.0.1:1025:1025"
+      - "127.0.0.1:8025:8025"
+
+volumes:
+  ginplate-storage:
+  mysql-data:
+  redis-data:
