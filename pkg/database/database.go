@@ -50,6 +50,15 @@ func Connect(driver, dsn string, gormLog ...glogger.Interface) (*gorm.DB, error)
 	sqlDB.SetMaxIdleConns(5)
 	sqlDB.SetMaxOpenConns(20)
 	sqlDB.SetConnMaxLifetime(30 * time.Minute)
+	sqlDB.SetConnMaxIdleTime(5 * time.Minute)
+	// GORM opens lazily: ping so boot fails fast on a dead database
+	// instead of succeeding until the first query.
+	pingCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := sqlDB.PingContext(pingCtx); err != nil {
+		_ = sqlDB.Close()
+		return nil, err
+	}
 	return db, nil
 }
 
@@ -80,33 +89,58 @@ func (d DB) CreateDB() error {
 	return nil
 }
 
+// migrationTimeout bounds every migration operation so a blocked database
+// cannot hang a deploy forever. Callers needing cancellation pass their own
+// context to the *Ctx variants.
+const migrationTimeout = 2 * time.Minute
+
 // Up applies all pending migrations. Backs `migrate up`.
 func (d DB) Up() error {
-	return withDB(d.driver, d.dsn, func(db *sql.DB) error {
-		return goose.UpContext(context.Background(), db, d.dir())
+	return d.UpCtx(context.Background())
+}
+
+// UpCtx applies all pending migrations with cancellation.
+func (d DB) UpCtx(ctx context.Context) error {
+	return withDBCtx(ctx, d.driver, d.dsn, func(ctx context.Context, db *sql.DB) error {
+		return goose.UpContext(ctx, db, d.dir())
 	})
 }
 
 // Status reports applied/pending migrations. Backs `migrate status`.
 func (d DB) Status() error {
-	return withDB(d.driver, d.dsn, func(db *sql.DB) error {
-		return goose.StatusContext(context.Background(), db, d.dir())
+	return d.StatusCtx(context.Background())
+}
+
+// StatusCtx reports applied/pending migrations with cancellation.
+func (d DB) StatusCtx(ctx context.Context) error {
+	return withDBCtx(ctx, d.driver, d.dsn, func(ctx context.Context, db *sql.DB) error {
+		return goose.StatusContext(ctx, db, d.dir())
 	})
 }
 
 // RollbackLast reverts the most recently applied migration. Backs
 // `migrate rollback`.
 func (d DB) RollbackLast() error {
-	return withDB(d.driver, d.dsn, func(db *sql.DB) error {
-		return goose.DownContext(context.Background(), db, d.dir())
+	return d.RollbackLastCtx(context.Background())
+}
+
+// RollbackLastCtx reverts the most recent migration with cancellation.
+func (d DB) RollbackLastCtx(ctx context.Context) error {
+	return withDBCtx(ctx, d.driver, d.dsn, func(ctx context.Context, db *sql.DB) error {
+		return goose.DownContext(ctx, db, d.dir())
 	})
 }
 
 // RollbackAll reverts every applied migration, newest first. Backs
 // `migrate reset`.
 func (d DB) RollbackAll() error {
-	return withDB(d.driver, d.dsn, func(db *sql.DB) error {
-		return goose.DownToContext(context.Background(), db, d.dir(), 0)
+	return d.RollbackAllCtx(context.Background())
+}
+
+// RollbackAllCtx reverts every migration with cancellation.
+func (d DB) RollbackAllCtx(ctx context.Context) error {
+	return withDBCtx(ctx, d.driver, d.dsn, func(ctx context.Context, db *sql.DB) error {
+		return goose.DownToContext(ctx, db, d.dir(), 0)
 	})
 }
 
@@ -163,6 +197,14 @@ func Open(driver, gormDSN string) (*sql.DB, error) {
 // withDB opens a database/sql handle with the goose dialect selected and the
 // embedded migration FS mounted, then runs fn.
 func withDB(driver, gormDSN string, fn func(db *sql.DB) error) error {
+	return withDBCtx(context.Background(), driver, gormDSN, func(_ context.Context, db *sql.DB) error {
+		return fn(db)
+	})
+}
+
+// withDBCtx is withDB with cancellation: every migration runs under a
+// timeout so a blocked connection cannot hang a deploy indefinitely.
+func withDBCtx(ctx context.Context, driver, gormDSN string, fn func(ctx context.Context, db *sql.DB) error) error {
 	driver = NormalizeDriver(driver)
 	if err := goose.SetDialect(gooseDialect(driver)); err != nil {
 		return err
@@ -173,7 +215,9 @@ func withDB(driver, gormDSN string, fn func(db *sql.DB) error) error {
 		return err
 	}
 	defer db.Close()
-	return fn(db)
+	ctx, cancel := context.WithTimeout(ctx, migrationTimeout)
+	defer cancel()
+	return fn(ctx, db)
 }
 
 // dropAllTables empties the database without dropping the database itself,
@@ -184,7 +228,8 @@ func dropAllTables(driver, gormDSN string) error {
 		return err
 	}
 	defer db.Close()
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), migrationTimeout)
+	defer cancel()
 	if driver == "pgsql" {
 		if _, err := db.ExecContext(ctx, `DROP SCHEMA public CASCADE`); err != nil {
 			return err
@@ -214,7 +259,12 @@ func dropAllTables(driver, gormDSN string) error {
 	if _, err := db.ExecContext(ctx, `SET FOREIGN_KEY_CHECKS = 0`); err != nil {
 		return err
 	}
-	defer db.ExecContext(context.Background(), `SET FOREIGN_KEY_CHECKS = 1`)
+	defer func() {
+		if _, err := db.ExecContext(context.Background(), `SET FOREIGN_KEY_CHECKS = 1`); err != nil {
+			// Best-effort restore; the drop already succeeded.
+			_ = err
+		}
+	}()
 	for _, t := range tables {
 		if !identRe.MatchString(t) {
 			return fmt.Errorf("refusing to drop unexpected table %q", t)
@@ -271,24 +321,28 @@ func DBName(driver, gormDSN string) string {
 // CreateDB creates the named database if missing.
 func CreateDB(driver, serverGormDSN, name string) error {
 	driver = NormalizeDriver(driver)
+	if !identRe.MatchString(name) {
+		return fmt.Errorf("invalid database name %q", name)
+	}
 	db, err := Open(driver, ServerDSN(driver, serverGormDSN))
 	if err != nil {
 		return err
 	}
 	defer db.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), migrationTimeout)
+	defer cancel()
 	if driver == "pgsql" {
-		if quoteIdent(name) == "" {
-			return fmt.Errorf("invalid database name")
-		}
 		var one int
-		err := db.QueryRow(fmt.Sprintf(`SELECT 1 FROM pg_database WHERE datname = '%s'`, name)).Scan(&one)
+		// datname cannot use a placeholder in all pg drivers for this
+		// catalog probe; name is identRe-validated above.
+		err := db.QueryRowContext(ctx, fmt.Sprintf(`SELECT 1 FROM pg_database WHERE datname = '%s'`, name)).Scan(&one)
 		if err == nil {
 			return nil // exists
 		}
-		_, err = db.Exec(fmt.Sprintf(`CREATE DATABASE "%s"`, name))
+		_, err = db.ExecContext(ctx, fmt.Sprintf(`CREATE DATABASE "%s"`, name))
 		return err
 	}
-	_, err = db.Exec("CREATE DATABASE IF NOT EXISTS `" + name + "` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
+	_, err = db.ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS `"+name+"` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci")
 	return err
 }
 

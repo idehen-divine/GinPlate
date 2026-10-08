@@ -23,7 +23,10 @@ type App struct {
 }
 
 // HTTP holds server timeouts and edge hardening. CORSAllowedOrigins is a
-// comma-separated list; empty means allow all (local dev only).
+// comma-separated list; empty means allow all (local dev only, rejected in
+// production by Validate). TLSCertFile/TLSKeyFile enable direct HTTPS via
+// ListenAndServeTLS; when empty, TLS must terminate at a reverse proxy and
+// production APP_URL must still be https.
 type HTTP struct {
 	ReadTimeoutSec     int     `mapstructure:"HTTP_READ_TIMEOUT_SEC"`
 	WriteTimeoutSec    int     `mapstructure:"HTTP_WRITE_TIMEOUT_SEC"`
@@ -32,6 +35,8 @@ type HTTP struct {
 	CORSAllowedOrigins string  `mapstructure:"CORS_ALLOWED_ORIGINS"`
 	RateLimitRPS       float64 `mapstructure:"RATE_LIMIT_RPS"`
 	EnableGzip         bool    `mapstructure:"ENABLE_GZIP"`
+	TLSCertFile        string  `mapstructure:"TLS_CERT_FILE"`
+	TLSKeyFile         string  `mapstructure:"TLS_KEY_FILE"`
 }
 
 // Maintenance holds maintenance-mode settings. Only the file driver is
@@ -55,6 +60,8 @@ func applyAppDefaults(v *viper.Viper) {
 	v.SetDefault("CORS_ALLOWED_ORIGINS", "")
 	v.SetDefault("RATE_LIMIT_RPS", 10)
 	v.SetDefault("ENABLE_GZIP", true)
+	v.SetDefault("TLS_CERT_FILE", "")
+	v.SetDefault("TLS_KEY_FILE", "")
 	v.SetDefault("ENABLE_SWAGGER", false)
 	v.SetDefault("APP_MAINTENANCE_DRIVER", "file")
 	v.SetDefault("APP_MAINTENANCE_PATH", "storage/framework/down")
