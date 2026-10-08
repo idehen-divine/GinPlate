@@ -1,6 +1,6 @@
 .env
 bin/
-storage/
+/storage/
 docs/docs.go
 docs/swagger.*
 *.test
