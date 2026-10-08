@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -60,8 +61,10 @@ type TokenClaims struct {
 
 // RequireAuth validates `Authorization: Bearer <jwt>` then checks the
 // session store for the access half, so logout invalidation takes effect
-// immediately. key is the raw HMAC signing key; a nil store disables the
-// session check (tokens validate by signature only).
+// immediately. key is the raw HMAC signing key. Only HS256 access tokens
+// with the current version are accepted; refresh tokens are rejected.
+// A nil store disables the session check (tokens validate by signature
+// only) and must only be used for local development.
 func RequireAuth(key []byte, store session.Store) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		h := c.GetHeader("Authorization")
@@ -73,9 +76,12 @@ func RequireAuth(key []byte, store session.Store) gin.HandlerFunc {
 		}
 		var claims TokenClaims
 		tok, err := jwt.ParseWithClaims(tokenStr, &claims, func(t *jwt.Token) (interface{}, error) {
+			if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+				return nil, fmt.Errorf("unexpected signing method %v", t.Header["alg"])
+			}
 			return key, nil
-		})
-		if err != nil || !tok.Valid || claims.Version != TokenVersion {
+		}, jwt.WithValidMethods([]string{"HS256"}))
+		if err != nil || !tok.Valid || claims.Version != TokenVersion || claims.Type != "access" {
 			Fail(c, http.StatusUnauthorized, "Invalid token.", nil)
 			c.Abort()
 			return

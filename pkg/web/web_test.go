@@ -219,9 +219,10 @@ func TestWeb(t *testing.T) {
 			if w.Code != http.StatusInternalServerError {
 				t.Fatalf("debug=%v: status = %d", dbg, w.Code)
 			}
-			hasErrs := bodyMap(t, w)["errors"] != nil
-			if hasErrs != dbg {
-				t.Fatalf("debug=%v: errors present = %v", dbg, hasErrs)
+			// Recovery never exposes panic detail to clients, even in
+			// debug mode; detail is logged server-side only.
+			if bodyMap(t, w)["errors"] != nil {
+				t.Fatalf("debug=%v: recovery leaked errors payload", dbg)
 			}
 			if logged == 0 {
 				t.Fatalf("debug=%v: panic was not logged server-side", dbg)
@@ -306,6 +307,64 @@ func TestWeb(t *testing.T) {
 		RequireAuth(key, nil)(c)
 		if w.Code != http.StatusUnauthorized {
 			t.Fatalf("stale version = %d, want 401", w.Code)
+		}
+	})
+
+	t.Run("auth/refresh-rejected-as-access", func(t *testing.T) {
+		key := []byte("0123456789abcdef0123456789abcdef")
+		tok := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+			"sub": uuid.NewString(), "jti": uuid.NewString(), "ver": TokenVersion, "type": "refresh",
+			"iat": time.Now().Unix(), "exp": time.Now().Add(24 * time.Hour).Unix(),
+		})
+		signed, err := tok.SignedString(key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c, w := testCtx(t, "GET", "/users")
+		c.Request.Header.Set("Authorization", "Bearer "+signed)
+		RequireAuth(key, nil)(c)
+		if w.Code != http.StatusUnauthorized {
+			t.Fatalf("refresh as access = %d, want 401", w.Code)
+		}
+	})
+
+	t.Run("auth/wrong-alg-rejected", func(t *testing.T) {
+		key := []byte("0123456789abcdef0123456789abcdef")
+		tok := jwt.NewWithClaims(jwt.SigningMethodNone, jwt.MapClaims{
+			"sub": uuid.NewString(), "jti": uuid.NewString(), "ver": TokenVersion, "type": "access",
+			"iat": time.Now().Unix(), "exp": time.Now().Add(time.Hour).Unix(),
+		})
+		signed, err := tok.SignedString(jwt.UnsafeAllowNoneSignatureType)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c, w := testCtx(t, "GET", "/users")
+		c.Request.Header.Set("Authorization", "Bearer "+signed)
+		RequireAuth(key, nil)(c)
+		if w.Code != http.StatusUnauthorized {
+			t.Fatalf("none alg = %d, want 401", w.Code)
+		}
+	})
+
+	t.Run("auth/revoked-rejected", func(t *testing.T) {
+		key := []byte("0123456789abcdef0123456789abcdef")
+		store := newStubSessionStore()
+		uid := uuid.NewString()
+		accessJTI := uuid.NewString()
+		tok := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+			"sub": uid, "jti": accessJTI, "ver": TokenVersion, "type": "access",
+			"iat": time.Now().Unix(), "exp": time.Now().Add(time.Hour).Unix(),
+		})
+		signed, err := tok.SignedString(key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// No session linked: revoked/unknown must fail closed.
+		c, w := testCtx(t, "GET", "/users")
+		c.Request.Header.Set("Authorization", "Bearer "+signed)
+		RequireAuth(key, store)(c)
+		if w.Code != http.StatusUnauthorized {
+			t.Fatalf("revoked = %d, want 401", w.Code)
 		}
 	})
 

@@ -18,7 +18,9 @@ type CORSConfig struct {
 	AllowCredentials bool
 }
 
-// CORS handles preflight and sets ACAO headers.
+// CORS handles preflight and sets ACAO headers. An empty allow-list means
+// allow-all and is only appropriate for local development; production must
+// set explicit origins (validated at startup by config.Validate).
 func CORS(cfg CORSConfig) gin.HandlerFunc {
 	allowAll := len(cfg.AllowedOrigins) == 0
 	allowed := map[string]bool{}
@@ -43,6 +45,8 @@ func CORS(cfg CORSConfig) gin.HandlerFunc {
 		}
 		h := c.Writer.Header()
 		h.Set("Access-Control-Allow-Origin", allowOrigin)
+		// Caches must key on Origin when the value varies per caller.
+		h.Set("Vary", "Origin")
 		if cfg.AllowCredentials && allowOrigin != "*" {
 			h.Set("Access-Control-Allow-Credentials", "true")
 		}
@@ -77,8 +81,10 @@ func Security() gin.HandlerFunc {
 }
 
 // RateLimit caps requests per second per instance (tollbooth, in-memory).
-// NOTE: per-instance only. For multi-replica deployments add a Redis
-// sliding-window limiter as a follow-up.
+// NOTE: per-instance only, not a distributed defense. For multi-replica
+// deployments add a Redis sliding-window limiter or enforce equivalent
+// controls at the API gateway, with stricter per-endpoint limits on
+// login, signup, refresh, password reset, and token-check endpoints.
 func RateLimit(requestsPerSecond float64) gin.HandlerFunc {
 	if requestsPerSecond <= 0 {
 		requestsPerSecond = 10
