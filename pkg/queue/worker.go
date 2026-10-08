@@ -55,7 +55,9 @@ func DispatchBuried(ctx context.Context, q Queue, reg *Registry, job Job, logf f
 	if !ok {
 		cause := fmt.Errorf("queue: no handler for %q", job.Name)
 		logf("queue: no handler for %q, burying job %s", job.Name, job.ID)
-		_ = q.Ack(ctx, job.ID)
+		if err := q.Ack(ctx, job.ID); err != nil {
+			logf("queue: ack unknown job %s: %v", job.ID, err)
+		}
 		notifyBuried(cause)
 		settled(job, hooks)
 		return
@@ -74,7 +76,9 @@ func DispatchBuried(ctx context.Context, q Queue, reg *Registry, job Job, logf f
 		settled(job, hooks)
 		return
 	}
-	_ = q.Ack(ctx, job.ID)
+	if err := q.Ack(ctx, job.ID); err != nil {
+		logf("queue: ack job %s (%s): %v (job may be redelivered)", job.ID, job.Name, err)
+	}
 	settled(job, hooks)
 }
 

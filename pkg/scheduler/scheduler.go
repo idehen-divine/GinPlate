@@ -94,6 +94,36 @@ var (
 	entries []Entry
 )
 
+// Registry is an explicit per-application schedule. Prefer it over the
+// package-global Schedule/Registered helpers (kept for generated code):
+// explicit registries isolate tests and multiple app instances in one
+// process instead of sharing global state.
+type Registry struct {
+	mu      sync.RWMutex
+	entries []Entry
+}
+
+// NewRegistry returns an empty schedule registry.
+func NewRegistry() *Registry { return &Registry{} }
+
+// Add registers entries on this registry.
+func (r *Registry) Add(es ...*Entry) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, e := range es {
+		if e != nil {
+			r.entries = append(r.entries, *e)
+		}
+	}
+}
+
+// All returns the registry entries in registration order.
+func (r *Registry) All() []Entry {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return append([]Entry(nil), r.entries...)
+}
+
 // Schedule registers entries, usually from init() in internal/jobs.
 // Specs and job names are validated when the scheduler prepares to run.
 // Entries are copied: later mutation of the builder does not affect the
@@ -198,6 +228,17 @@ func (s *State) CheckAndFire(ctx context.Context, q queue.Queue, locker Locker, 
 				continue
 			}
 			payload = wrapPayload(e.Payload, overlapKey(e.Name), token)
+			id, err := q.Push(ctx, e.Job, payload)
+			if err != nil {
+				// Release the just-acquired lock: a transient push
+				// failure must not wedge the entry until the TTL.
+				releaseCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				_ = locker.Release(releaseCtx, overlapKey(e.Name), token)
+				cancel()
+				return fmt.Errorf("scheduler: push %q: %w", e.Name, err)
+			}
+			logf("scheduler: entry %q pushed job %s", e.Name, id)
+			continue
 		}
 		id, err := q.Push(ctx, e.Job, payload)
 		if err != nil {

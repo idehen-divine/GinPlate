@@ -31,7 +31,9 @@ func NewLocal(dir, urlBase string) (Storage, error) {
 }
 
 // resolve maps a relative path into the root, rejecting absolute paths
-// and ".." escapes so callers can never leave the disk.
+// and ".." escapes so callers can never leave the disk. It also resolves
+// symlinks (EvalSymlinks) and re-checks containment, so a symlink planted
+// beneath the root cannot redirect reads/writes outside it.
 func (d *localDisk) resolve(path string) (string, error) {
 	if path == "" || filepath.IsAbs(path) {
 		return "", fmt.Errorf("storage: invalid path %q", path)
@@ -40,6 +42,31 @@ func (d *localDisk) resolve(path string) (string, error) {
 	rel, err := filepath.Rel(d.root, full)
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return "", fmt.Errorf("storage: path escapes disk root %q", path)
+	}
+	// Resolve symlinks in the root and in the target's parent: lexical
+	// containment alone is bypassed by `root/link -> /etc`.
+	realRoot, err := filepath.EvalSymlinks(d.root)
+	if err != nil {
+		return "", fmt.Errorf("storage: resolve root: %w", err)
+	}
+	parent := filepath.Dir(full)
+	realParent := parent
+	if st, err := os.Lstat(parent); err == nil && st.Mode()&os.ModeSymlink != 0 {
+		if rp, err := filepath.EvalSymlinks(parent); err == nil {
+			realParent = rp
+		}
+	} else if _, err := os.Lstat(full); err == nil {
+		if rf, err := filepath.EvalSymlinks(full); err == nil {
+			realParent = filepath.Dir(rf)
+		}
+	}
+	if rel, err := filepath.Rel(realRoot, filepath.Join(realParent, filepath.Base(full))); err != nil ||
+		rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("storage: path escapes disk root %q", path)
+	}
+	// Refuse to follow a symlink at the final component itself.
+	if st, err := os.Lstat(full); err == nil && st.Mode()&os.ModeSymlink != 0 {
+		return "", fmt.Errorf("storage: refusing symlink path %q", path)
 	}
 	return full, nil
 }

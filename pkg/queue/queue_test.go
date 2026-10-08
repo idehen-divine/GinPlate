@@ -55,6 +55,11 @@ type buryQueue struct{ fakeQueue }
 
 func (q *buryQueue) Fail(_ context.Context, job Job, _ error) error { return ErrJobBuried }
 
+// ackFailQueue fails every Ack to pin the ack-failure logging path.
+type ackFailQueue struct{ fakeQueue }
+
+func (q *ackFailQueue) Ack(_ context.Context, _ string) error { return errTestBoom }
+
 // recordStore is a FailedStore keeping rows in memory.
 type recordStore struct{ rows []FailedJob }
 
@@ -445,6 +450,50 @@ func TestQueue(t *testing.T) {
 		}
 		if len(store.rows) != 0 {
 			t.Fatalf("rows after delete = %+v", store.rows)
+		}
+	})
+
+	t.Run("dispatch/ack-failure-logged", func(t *testing.T) {
+		ctx := context.Background()
+		var logged []string
+		logf := func(format string, args ...interface{}) {
+			logged = append(logged, format)
+		}
+		reg := NewRegistry()
+		reg.Handle("ok", func(_ context.Context, _ Job) error { return nil })
+		q := &ackFailQueue{fakeQueue: fakeQueue{jobs: []Job{{ID: "a1", Name: "ok", Attempts: 1}}}}
+		Dispatch(ctx, q, reg, Job{ID: "a1", Name: "ok", Attempts: 1}, logf)
+		found := false
+		for _, m := range logged {
+			if strings.Contains(m, "ack job") {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("ack failure not logged: %v", logged)
+		}
+	})
+
+	t.Run("dispatch/unknown-name-buried", func(t *testing.T) {
+		ctx := context.Background()
+		noop := func(format string, args ...interface{}) {}
+		q := &fakeQueue{}
+		Dispatch(ctx, q, NewRegistry(), Job{ID: "u1", Name: "ghost", Attempts: 1}, noop)
+		if len(q.acked) != 1 {
+			t.Fatalf("unknown job not acked: %+v", q.acked)
+		}
+	})
+
+	t.Run("reserve-timeout-configurable", func(t *testing.T) {
+		old := retryAfter
+		t.Cleanup(func() { retryAfter = old })
+		SetReservationTimeout(time.Minute)
+		if retryAfter != time.Minute {
+			t.Fatalf("retryAfter = %v", retryAfter)
+		}
+		SetReservationTimeout(0)
+		if retryAfter != 60*time.Second {
+			t.Fatalf("reset retryAfter = %v", retryAfter)
 		}
 	})
 

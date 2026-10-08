@@ -12,8 +12,19 @@ import (
 // retryAfter bounds how long a reservation may run before another worker
 // may take the job. It must exceed any plausible handler runtime; crashed
 // workers' jobs become eligible again after this window instead of
-// sticking forever.
-const retryAfter = 60 * time.Second
+// sticking forever. Configure via SetReservationTimeout or QUEUE_RESERVE_AFTER_SEC;
+// handlers exceeding the window may execute concurrently, so all handlers
+// must be idempotent or implement lease renewal.
+var retryAfter = 60 * time.Second
+
+// SetReservationTimeout overrides the reservation visibility window (for
+// tests and long-running-job deployments). Values <= 0 restore 60s.
+func SetReservationTimeout(d time.Duration) {
+	if d <= 0 {
+		d = 60 * time.Second
+	}
+	retryAfter = d
+}
 
 // jobRow maps the jobs migration table. Attempts counts pops including the
 // current one; a NULL reserved_at means never reserved or released back.
