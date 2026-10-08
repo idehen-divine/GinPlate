@@ -60,7 +60,10 @@ func (h *Handler) Login(c *gin.Context) {
 // @Router /auth/logout [post]
 func (h *Handler) Logout(c *gin.Context) {
 	if cl := web.CurrentClaims(c); cl != nil {
-		h.svc.Logout(cl.SessionID)
+		if err := h.svc.Logout(cl.SessionID); err != nil {
+			web.Render(c, err)
+			return
+		}
 	}
 	web.Success(c, http.StatusOK, "Logged out.", nil)
 }

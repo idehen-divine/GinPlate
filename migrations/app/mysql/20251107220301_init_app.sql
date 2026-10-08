@@ -4,8 +4,13 @@
 -- users(id), which the earlier users migration creates first.
 CREATE TABLE IF NOT EXISTS password_reset_tokens (
   email VARCHAR(255) PRIMARY KEY,
-  token VARCHAR(255) NOT NULL,
-  created_at TIMESTAMP NULL DEFAULT NULL
+  -- Only the SHA-256 hex digest is persisted; the raw token is emailed
+  -- once and never stored. Single-use via used_at, expiry via expires_at.
+  token_hash VARCHAR(64) NOT NULL,
+  expires_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  used_at TIMESTAMP NULL DEFAULT NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY uq_password_reset_token_hash (token_hash)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS sessions (

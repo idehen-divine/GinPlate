@@ -2,6 +2,10 @@ package auth
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -66,6 +70,11 @@ func (s *Service) WithNotifications(n *notify.Notifier, q queue.Queue, appName, 
 // SendPasswordReset delivers the forgot-password mailable for email/token
 // through the attached mailer. It reports an error when no mailer is
 // configured, so callers fail loudly instead of silently dropping mail.
+//
+// Security contract: the token argument is the raw one-time secret for the
+// email only. Persist HashResetToken(token) with an expiry (e.g. 60
+// minutes) and single-use marker, never the raw token; revoke sessions
+// after a successful reset. See migrations *password_reset_hash.
 func (s *Service) SendPasswordReset(ctx context.Context, appURL, name, email, token string, expiresMinutes int) error {
 	if s.mailer == nil {
 		return web.Internal(errors.New("mailer not configured"))
@@ -77,6 +86,23 @@ func (s *Service) SendPasswordReset(ctx context.Context, appURL, name, email, to
 		Token:          token,
 		ExpiresMinutes: expiresMinutes,
 	})
+}
+
+// MintResetToken creates a 32-byte random password-reset secret encoded as
+// unpadded base64url for use in emailed links.
+func MintResetToken() (string, error) {
+	var raw [32]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(raw[:]), nil
+}
+
+// HashResetToken returns the SHA-256 hex digest to persist for a reset
+// token. The raw token is emailed once and never stored.
+func HashResetToken(rawToken string) string {
+	sum := sha256.Sum256([]byte(rawToken))
+	return hex.EncodeToString(sum[:])
 }
 
 // Register hashes the password and creates a member account. A duplicate
@@ -134,11 +160,11 @@ func (s *Service) Login(db *gorm.DB, dto LoginDTO) (*users.User, *TokenPair, err
 	return &u, pair, nil
 }
 
-// issue mints an access + refresh pair and links both session halves in
-// Redis: session:{accessJti} -> refreshJti and refresh:{refreshJti} ->
-// accessJti. Either half suffices to find and destroy the whole session.
-func (s *Service) issue(u *users.User) (*TokenPair, error) {
-	ctx := context.Background()
+// mint signs an access + refresh pair without touching the session store.
+// The caller persists the returned JTIs (Link or ReplaceRefresh) and must
+// discard the pair when persistence fails: unstored JTIs never validate, so
+// a dropped pair fails closed instead of minting untracked tokens.
+func (s *Service) mint(u *users.User) (pair *TokenPair, accessJti, refreshJti string, err error) {
 	jti := uuid.NewString()
 	rjti := uuid.NewString()
 	now := time.Now()
@@ -149,7 +175,7 @@ func (s *Service) issue(u *users.User) (*TokenPair, error) {
 	}
 	access, err := jwt.NewWithClaims(jwt.SigningMethodHS256, accessClaims).SignedString(s.key)
 	if err != nil {
-		return nil, err
+		return nil, "", "", err
 	}
 	refreshClaims := jwt.MapClaims{
 		"sub": u.ID.String(),
@@ -158,29 +184,54 @@ func (s *Service) issue(u *users.User) (*TokenPair, error) {
 	}
 	refresh, err := jwt.NewWithClaims(jwt.SigningMethodHS256, refreshClaims).SignedString(s.key)
 	if err != nil {
-		return nil, err
+		return nil, "", "", err
+	}
+	return &TokenPair{AccessToken: access, RefreshToken: refresh, TokenType: "Bearer", ExpiresIn: int(s.accessTTL.Seconds())}, jti, rjti, nil
+}
+
+// issue mints an access + refresh pair and links both session halves in
+// Redis: session:{accessJti} -> refreshJti and refresh:{refreshJti} ->
+// accessJti. Either half suffices to find and destroy the whole session.
+// Session persistence is part of issuance: a Link failure is returned so
+// untracked tokens are never handed out.
+func (s *Service) issue(u *users.User) (*TokenPair, error) {
+	pair, jti, rjti, err := s.mint(u)
+	if err != nil {
+		return nil, err // caller wraps with its operation message
 	}
 	if s.store != nil {
-		_ = s.store.Link(ctx, jti, rjti, u.ID.String(), s.accessTTL, s.refreshTTL)
+		if err := s.store.Link(context.Background(), jti, rjti, u.ID.String(), s.accessTTL, s.refreshTTL); err != nil {
+			return nil, web.Wrap(http.StatusInternalServerError, "Could not create session.", err)
+		}
 	}
-	return &TokenPair{AccessToken: access, RefreshToken: refresh, TokenType: "Bearer", ExpiresIn: int(s.accessTTL.Seconds())}, nil
+	return pair, nil
 }
 
 // Logout destroys the whole session: the access half and its linked refresh
-// half. Missing halves are fine, so logout stays idempotent.
-func (s *Service) Logout(sessionID string) {
+// half. Missing halves are fine, so logout stays idempotent. Backend
+// failures are returned so callers can fail closed instead of reporting a
+// revocation that never happened.
+func (s *Service) Logout(sessionID string) error {
 	if s.store == nil || sessionID == "" {
-		return
+		return nil
 	}
 	ctx := context.Background()
 	rjti, _ := s.store.AccessValid(ctx, sessionID)
-	_ = s.store.Unlink(ctx, sessionID, rjti)
+	if err := s.store.Unlink(ctx, sessionID, rjti); err != nil {
+		return web.Wrap(http.StatusInternalServerError, "Could not log out.", err)
+	}
+	return nil
 }
 
-// Refresh validates a refresh token and rotates the session: the presented
-// refresh half must still exist in Redis (logout or a prior rotation deletes
-// it), then a fresh pair is issued and the old halves are destroyed. A
-// revoked or replayed refresh token is rejected before any database access.
+// Refresh validates a refresh token and rotates the session in one atomic
+// replacement: the old refresh half is consumed and the new session halves
+// are recorded together, so exactly one concurrent request with the same
+// refresh token can succeed. All read-only work (token validation, user
+// lookup, active check) and token signing happen before anything is
+// consumed; only the final ReplaceRefresh mutates state, and its failure
+// rolls back where the backend allows (Redis script atomicity, DB
+// transaction), so a transient outage cannot strand the user without a
+// session. A revoked or replayed refresh token is rejected with 401.
 func (s *Service) Refresh(db *gorm.DB, refreshToken string) (*users.User, *TokenPair, error) {
 	claims, err := s.parse(refreshToken)
 	if err != nil {
@@ -193,16 +244,18 @@ func (s *Service) Refresh(db *gorm.DB, refreshToken string) (*users.User, *Token
 	if rjti == "" {
 		return nil, nil, web.Unauthorized("Invalid refresh token.")
 	}
-	var oldAccess string
-	if s.store != nil {
-		var ok bool
-		if oldAccess, ok = s.store.RefreshValid(context.Background(), rjti); !ok {
-			return nil, nil, web.Unauthorized("Session revoked.")
-		}
-	}
 	sub, _ := claims["sub"].(string)
 	if sub == "" {
 		return nil, nil, web.Unauthorized("Invalid refresh token.")
+	}
+	ctx := context.Background()
+	if s.store != nil {
+		// Read-only early rejection for revoked tokens (no state change,
+		// so no DB is needed on this path). This is an optimization only:
+		// ReplaceRefresh below remains the atomic arbiter for races.
+		if _, ok := s.store.RefreshValid(ctx, rjti); !ok {
+			return nil, nil, web.Unauthorized("Session revoked.")
+		}
 	}
 	var u users.User
 	if err := db.Where("id = ?", sub).First(&u).Error; err != nil {
@@ -214,12 +267,20 @@ func (s *Service) Refresh(db *gorm.DB, refreshToken string) (*users.User, *Token
 	if !u.IsActive {
 		return nil, nil, web.Unauthorized("Invalid credentials.")
 	}
-	pair, err := s.issue(&u)
+	pair, newAccessJti, newRefreshJti, err := s.mint(&u)
 	if err != nil {
 		return nil, nil, web.Wrap(http.StatusInternalServerError, "Could not refresh.", err)
 	}
 	if s.store != nil {
-		_ = s.store.Unlink(context.Background(), oldAccess, rjti)
+		// The minted pair is only handed out when the replacement commits;
+		// unstored JTIs never validate, so a dropped pair fails closed.
+		_, ok, err := s.store.ReplaceRefresh(ctx, rjti, newAccessJti, newRefreshJti, u.ID.String(), s.accessTTL, s.refreshTTL)
+		if err != nil {
+			return nil, nil, web.Wrap(http.StatusInternalServerError, "Could not refresh.", err)
+		}
+		if !ok {
+			return nil, nil, web.Unauthorized("Session revoked.")
+		}
 	}
 	return &u, pair, nil
 }

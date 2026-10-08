@@ -4,9 +4,14 @@
 -- users(id), which the earlier users migration creates first.
 CREATE TABLE IF NOT EXISTS password_reset_tokens (
   email VARCHAR(255) PRIMARY KEY,
-  token VARCHAR(255) NOT NULL,
-  created_at TIMESTAMPTZ
+  -- Only the SHA-256 hex digest is persisted; the raw token is emailed
+  -- once and never stored. Single-use via used_at, expiry via expires_at.
+  token_hash VARCHAR(64) NOT NULL,
+  expires_at TIMESTAMPTZ NOT NULL,
+  used_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+CREATE UNIQUE INDEX IF NOT EXISTS uq_password_reset_token_hash ON password_reset_tokens(token_hash);
 
 CREATE TABLE IF NOT EXISTS sessions (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
