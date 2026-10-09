@@ -34,14 +34,16 @@ CREATE TABLE IF NOT EXISTS caches (
   INDEX idx_caches_expires (expires_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+-- Microsecond timestamps: FIFO order breaks on random UUIDs when pushes
+-- share a second, so available_at needs sub-second precision like pgsql.
 CREATE TABLE IF NOT EXISTS jobs (
   id CHAR(36) PRIMARY KEY,
   name VARCHAR(64) NOT NULL,
   payload TEXT NOT NULL,
   attempts INT NOT NULL DEFAULT 0,
-  available_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  reserved_at TIMESTAMP NULL DEFAULT NULL,
-  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  available_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+  reserved_at TIMESTAMP(6) NULL DEFAULT NULL,
+  created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
   INDEX idx_jobs_available (available_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 

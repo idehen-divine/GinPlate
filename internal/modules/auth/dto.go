@@ -3,12 +3,12 @@ package auth
 type SignupDTO struct {
 	Name     string `json:"name" binding:"required,max=255"`
 	Email    string `json:"email" binding:"required,email"`
-	Password string `json:"password" binding:"required,min=8"`
+	Password string `json:"password" binding:"required,min=8,max=72"`
 }
 
 type LoginDTO struct {
 	Email    string `json:"email" binding:"required,email"`
-	Password string `json:"password" binding:"required"`
+	Password string `json:"password" binding:"required,max=72"`
 }
 
 type TokenPair struct {

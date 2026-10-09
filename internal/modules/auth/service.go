@@ -15,6 +15,7 @@ import (
 	"github.com/google/uuid"
 	appmail "github.com/idehen-divine/GinPlate/internal/mail"
 	"github.com/idehen-divine/GinPlate/internal/mail/password_reset"
+	"github.com/idehen-divine/GinPlate/internal/middleware"
 	"github.com/idehen-divine/GinPlate/internal/modules/users"
 	notifwelcome "github.com/idehen-divine/GinPlate/internal/notifications/welcome"
 	"github.com/idehen-divine/GinPlate/pkg/mail"
@@ -25,6 +26,15 @@ import (
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
 )
+
+// AuthService is the behavior boundary handlers depend on.
+type AuthService interface {
+	Register(db *gorm.DB, dto SignupDTO) (*users.User, error)
+	Login(db *gorm.DB, dto LoginDTO) (*users.User, *TokenPair, error)
+	Logout(sessionID string) error
+	Refresh(db *gorm.DB, refreshToken string) (*users.User, *TokenPair, error)
+	Check(token string) CheckResult
+}
 
 type Service struct {
 	key        []byte
@@ -38,27 +48,21 @@ type Service struct {
 	appURL     string
 }
 
-// RefreshTTL is the fixed refresh-token lifetime: 30 days. Only the access
-// TTL is configurable (APP_TTL_MIN); refresh rotation keeps sessions alive.
+// RefreshTTL is the fixed refresh-token lifetime (access TTL comes from config).
 const RefreshTTL = 30 * 24 * time.Hour
 
-// NewService builds an auth Service. key is the raw HMAC signing key
-// (resolved from APP_KEY); accessMin is minutes. store may be nil, which
-// disables session tracking (tokens then validate by signature only).
+// NewService builds an auth Service. A nil store disables session tracking.
 func NewService(key []byte, accessMin int, store session.Store) *Service {
 	return &Service{key: key, accessTTL: time.Duration(accessMin) * time.Minute, refreshTTL: RefreshTTL, store: store}
 }
 
-// WithMailer attaches a mail sender for transactional email (password
-// reset). Nil is allowed and keeps the service usable without mail.
+// WithMailer attaches a mail sender (nil keeps the service usable without mail).
 func (s *Service) WithMailer(m mail.Sender) *Service {
 	s.mailer = m
 	return s
 }
 
-// WithNotifications attaches the welcome-notification fan-out for new
-// signups. Nil notifier/queue disables it; delivery failures are logged,
-// never fatal to registration.
+// WithNotifications attaches welcome fan-out for signups (best-effort, never fatal).
 func (s *Service) WithNotifications(n *notify.Notifier, q queue.Queue, appName, appURL string) *Service {
 	s.notifier = n
 	s.notifQueue = q
@@ -67,14 +71,9 @@ func (s *Service) WithNotifications(n *notify.Notifier, q queue.Queue, appName, 
 	return s
 }
 
-// SendPasswordReset delivers the forgot-password mailable for email/token
-// through the attached mailer. It reports an error when no mailer is
-// configured, so callers fail loudly instead of silently dropping mail.
-//
-// Security contract: the token argument is the raw one-time secret for the
-// email only. Persist HashResetToken(token) with an expiry (e.g. 60
-// minutes) and single-use marker, never the raw token; revoke sessions
-// after a successful reset. See migrations *password_reset_hash.
+// SendPasswordReset delivers the forgot-password mailable. token is the raw
+// one-time secret for the email only: persist HashResetToken(token), never
+// the raw token.
 func (s *Service) SendPasswordReset(ctx context.Context, appURL, name, email, token string, expiresMinutes int) error {
 	if s.mailer == nil {
 		return web.Internal(errors.New("mailer not configured"))
@@ -88,8 +87,7 @@ func (s *Service) SendPasswordReset(ctx context.Context, appURL, name, email, to
 	})
 }
 
-// MintResetToken creates a 32-byte random password-reset secret encoded as
-// unpadded base64url for use in emailed links.
+// MintResetToken creates a random password-reset secret for emailed links.
 func MintResetToken() (string, error) {
 	var raw [32]byte
 	if _, err := rand.Read(raw[:]); err != nil {
@@ -98,21 +96,19 @@ func MintResetToken() (string, error) {
 	return base64.RawURLEncoding.EncodeToString(raw[:]), nil
 }
 
-// HashResetToken returns the SHA-256 hex digest to persist for a reset
-// token. The raw token is emailed once and never stored.
+// HashResetToken returns the digest to persist for a reset token.
 func HashResetToken(rawToken string) string {
 	sum := sha256.Sum256([]byte(rawToken))
 	return hex.EncodeToString(sum[:])
 }
 
-// Register hashes the password and creates a member account. A duplicate
-// email surfaces as a database error, mapped to 409 by the handler.
+// Register hashes the password and creates a member account (duplicate → 409).
 func (s *Service) Register(db *gorm.DB, dto SignupDTO) (*users.User, error) {
 	hash, err := bcrypt.GenerateFromPassword([]byte(dto.Password), bcrypt.DefaultCost)
 	if err != nil {
 		return nil, err
 	}
-	u := &users.User{Name: dto.Name, Email: dto.Email, PasswordHash: string(hash), Role: "member", IsActive: true}
+	u := &users.User{Name: dto.Name, Email: dto.Email, PasswordHash: string(hash), Role: "member", IsActive: true, AuthVersion: 1}
 	if err := db.Create(u).Error; err != nil {
 		if errors.Is(err, gorm.ErrDuplicatedKey) {
 			return nil, web.Conflict("Email already taken.")
@@ -123,8 +119,7 @@ func (s *Service) Register(db *gorm.DB, dto SignupDTO) (*users.User, error) {
 	return u, nil
 }
 
-// notifyWelcome queues the welcome notification best-effort: delivery
-// failures are logged, never fatal to registration.
+// notifyWelcome queues the welcome notification (best-effort).
 func (s *Service) notifyWelcome(u *users.User) {
 	if s.notifier == nil || s.notifQueue == nil {
 		return
@@ -136,9 +131,8 @@ func (s *Service) notifyWelcome(u *users.User) {
 	}
 }
 
-// Login verifies email, password hash, and active status, then issues an
-// access + refresh token pair. Failures share one message so callers can't
-// probe which accounts exist.
+// Login verifies credentials and active status, then issues a token pair.
+// Failures share one message so callers can't probe which accounts exist.
 func (s *Service) Login(db *gorm.DB, dto LoginDTO) (*users.User, *TokenPair, error) {
 	var u users.User
 	if err := db.Where("email = ?", dto.Email).First(&u).Error; err != nil {
@@ -160,17 +154,15 @@ func (s *Service) Login(db *gorm.DB, dto LoginDTO) (*users.User, *TokenPair, err
 	return &u, pair, nil
 }
 
-// mint signs an access + refresh pair without touching the session store.
-// The caller persists the returned JTIs (Link or ReplaceRefresh) and must
-// discard the pair when persistence fails: unstored JTIs never validate, so
-// a dropped pair fails closed instead of minting untracked tokens.
+// mint signs a token pair without touching the store. The caller must persist
+// the JTIs: unstored JTIs never validate (fail closed).
 func (s *Service) mint(u *users.User) (pair *TokenPair, accessJti, refreshJti string, err error) {
 	jti := uuid.NewString()
 	rjti := uuid.NewString()
 	now := time.Now()
 	accessClaims := jwt.MapClaims{
 		"sub": u.ID.String(),
-		"jti": jti, "ver": "v1", "type": "access", "role": u.Role,
+		"jti": jti, "ver": "v1", "type": "access", "role": u.Role, "aver": u.AuthVersion,
 		"iat": now.Unix(), "exp": now.Add(s.accessTTL).Unix(),
 	}
 	access, err := jwt.NewWithClaims(jwt.SigningMethodHS256, accessClaims).SignedString(s.key)
@@ -179,7 +171,7 @@ func (s *Service) mint(u *users.User) (pair *TokenPair, accessJti, refreshJti st
 	}
 	refreshClaims := jwt.MapClaims{
 		"sub": u.ID.String(),
-		"jti": rjti, "ver": "v1", "type": "refresh", "role": u.Role,
+		"jti": rjti, "ver": "v1", "type": "refresh", "role": u.Role, "aver": u.AuthVersion,
 		"iat": now.Unix(), "exp": now.Add(s.refreshTTL).Unix(),
 	}
 	refresh, err := jwt.NewWithClaims(jwt.SigningMethodHS256, refreshClaims).SignedString(s.key)
@@ -189,11 +181,8 @@ func (s *Service) mint(u *users.User) (pair *TokenPair, accessJti, refreshJti st
 	return &TokenPair{AccessToken: access, RefreshToken: refresh, TokenType: "Bearer", ExpiresIn: int(s.accessTTL.Seconds())}, jti, rjti, nil
 }
 
-// issue mints an access + refresh pair and links both session halves in
-// Redis: session:{accessJti} -> refreshJti and refresh:{refreshJti} ->
-// accessJti. Either half suffices to find and destroy the whole session.
-// Session persistence is part of issuance: a Link failure is returned so
-// untracked tokens are never handed out.
+// issue mints a pair and links both session halves. A Link failure is
+// returned so untracked tokens are never handed out.
 func (s *Service) issue(u *users.User) (*TokenPair, error) {
 	pair, jti, rjti, err := s.mint(u)
 	if err != nil {
@@ -207,10 +196,7 @@ func (s *Service) issue(u *users.User) (*TokenPair, error) {
 	return pair, nil
 }
 
-// Logout destroys the whole session: the access half and its linked refresh
-// half. Missing halves are fine, so logout stays idempotent. Backend
-// failures are returned so callers can fail closed instead of reporting a
-// revocation that never happened.
+// Logout destroys the whole session (idempotent; backend failures returned).
 func (s *Service) Logout(sessionID string) error {
 	if s.store == nil || sessionID == "" {
 		return nil
@@ -223,15 +209,8 @@ func (s *Service) Logout(sessionID string) error {
 	return nil
 }
 
-// Refresh validates a refresh token and rotates the session in one atomic
-// replacement: the old refresh half is consumed and the new session halves
-// are recorded together, so exactly one concurrent request with the same
-// refresh token can succeed. All read-only work (token validation, user
-// lookup, active check) and token signing happen before anything is
-// consumed; only the final ReplaceRefresh mutates state, and its failure
-// rolls back where the backend allows (Redis script atomicity, DB
-// transaction), so a transient outage cannot strand the user without a
-// session. A revoked or replayed refresh token is rejected with 401.
+// Refresh rotates a refresh token into a new pair in one atomic replacement,
+// so exactly one concurrent use wins. Revoked or replayed tokens get 401.
 func (s *Service) Refresh(db *gorm.DB, refreshToken string) (*users.User, *TokenPair, error) {
 	claims, err := s.parse(refreshToken)
 	if err != nil {
@@ -250,9 +229,7 @@ func (s *Service) Refresh(db *gorm.DB, refreshToken string) (*users.User, *Token
 	}
 	ctx := context.Background()
 	if s.store != nil {
-		// Read-only early rejection for revoked tokens (no state change,
-		// so no DB is needed on this path). This is an optimization only:
-		// ReplaceRefresh below remains the atomic arbiter for races.
+		// Early rejection for revoked tokens; ReplaceRefresh below arbitrates races.
 		if _, ok := s.store.RefreshValid(ctx, rjti); !ok {
 			return nil, nil, web.Unauthorized("Session revoked.")
 		}
@@ -267,13 +244,17 @@ func (s *Service) Refresh(db *gorm.DB, refreshToken string) (*users.User, *Token
 	if !u.IsActive {
 		return nil, nil, web.Unauthorized("Invalid credentials.")
 	}
+	// A refresh token minted before a privilege change (role bump) must not
+	// mint fresh tokens: its aver no longer matches the row.
+	if aver, _ := claims["aver"].(float64); int(aver) != u.AuthVersion {
+		return nil, nil, web.Unauthorized("Session revoked.")
+	}
 	pair, newAccessJti, newRefreshJti, err := s.mint(&u)
 	if err != nil {
 		return nil, nil, web.Wrap(http.StatusInternalServerError, "Could not refresh.", err)
 	}
 	if s.store != nil {
-		// The minted pair is only handed out when the replacement commits;
-		// unstored JTIs never validate, so a dropped pair fails closed.
+		// Only hand out the pair when the replacement commits (fail closed).
 		_, ok, err := s.store.ReplaceRefresh(ctx, rjti, newAccessJti, newRefreshJti, u.ID.String(), s.accessTTL, s.refreshTTL)
 		if err != nil {
 			return nil, nil, web.Wrap(http.StatusInternalServerError, "Could not refresh.", err)
@@ -285,7 +266,6 @@ func (s *Service) Refresh(db *gorm.DB, refreshToken string) (*users.User, *Token
 	return &u, pair, nil
 }
 
-// CheckResult is the outcome of validating an arbitrary token.
 type CheckResult struct {
 	Valid     bool   `json:"valid"`
 	Type      string `json:"type,omitempty"`
@@ -293,13 +273,12 @@ type CheckResult struct {
 	ExpiresAt int64  `json:"expires_at,omitempty"`
 }
 
-// Check validates a token without side effects.
 func (s *Service) Check(token string) CheckResult {
 	claims, err := s.parse(token)
 	if err != nil {
 		return CheckResult{Valid: false}
 	}
-	if ver, _ := claims["ver"].(string); ver != web.TokenVersion {
+	if ver, _ := claims["ver"].(string); ver != middleware.TokenVersion {
 		return CheckResult{Valid: false}
 	}
 	exp, _ := claims["exp"].(float64)
@@ -308,7 +287,6 @@ func (s *Service) Check(token string) CheckResult {
 	return CheckResult{Valid: true, Type: typ, Role: role, ExpiresAt: int64(exp)}
 }
 
-// parse verifies the HMAC signature and expiry, returning the claims.
 func (s *Service) parse(token string) (jwt.MapClaims, error) {
 	parsed, err := jwt.ParseWithClaims(token, jwt.MapClaims{}, func(t *jwt.Token) (interface{}, error) {
 		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
