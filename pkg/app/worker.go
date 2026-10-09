@@ -23,34 +23,37 @@ import (
 // Only the selected driver is connected: database work needs no Redis
 // running, and sync work needs neither. Handlers come from internal/jobs
 // via blank import so cloners attach code without touching this file.
-func RunWorker(cfg *config.Config) error {
-	if cfg == nil {
+func RunWorker(config *config.Config) error {
+	if config == nil {
 		return fmt.Errorf("nil config")
 	}
-	appLog := logger.New(cfg.App.Env, cfg.Logging.Level, cfg.Logging.Output)
+	appLog := logger.New(config.App.Env, config.Logging.Level, config.Logging.Output)
 	defer appLog.Sync()
 
-	var db *gorm.DB
-	if cfg.Queue.Connection == "database" {
+	var databaseConnection *gorm.DB
+	if config.Queue.Connection == "database" {
 		var err error
-		db, err = database.Connect(cfg.Database.Driver, cfg.Database.DSN(), appLog.GormLogger(GormLogLevel(cfg.Database.LogMode), 0))
+		databaseConnection, err = database.ConnectPool(config.Database.Driver, config.Database.DSN(), dbPool(config), appLog.GormLogger(GormLogLevel(config.Database.LogMode), 0))
 		if err != nil {
 			return fmt.Errorf("database: %w", err)
 		}
-	}
-	var rdb *redis.Client
-	if cfg.Queue.Connection == "redis" {
-		rdb = redisPkg.DialOrNil(cfg.Database.Redis, 10*time.Second)
-		if rdb == nil {
-			return fmt.Errorf("redis unreachable at %s", cfg.Database.Redis.Addr())
+		if sqlDatabase, err := databaseConnection.DB(); err == nil {
+			defer sqlDatabase.Close()
 		}
-		defer func() { _ = rdb.Close() }()
 	}
-	q, err := queue.Open(cfg.Queue, db, rdb)
+	var redisClient *redis.Client
+	if config.Queue.Connection == "redis" {
+		redisClient = redisPkg.DialOrNil(config.Database.Redis, 10*time.Second)
+		if redisClient == nil {
+			return fmt.Errorf("redis unreachable at %s", config.Database.Redis.Addr())
+		}
+		defer func() { _ = redisClient.Close() }()
+	}
+	q, err := queue.Open(config.Queue, databaseConnection, redisClient)
 	if err != nil {
 		return err
 	}
-	if cfg.Queue.Connection == "sync" {
+	if config.Queue.Connection == "sync" {
 		appLog.Info("sync dispatches inline on push: no worker needed")
 		return nil
 	}
@@ -61,30 +64,30 @@ func RunWorker(cfg *config.Config) error {
 	// briefly, and skip the hook when Redis is unreachable (locks then
 	// expire via TTL instead of releasing early).
 	var hooks []queue.OnSettled
-	if lrdb := lockRedis(cfg); lrdb != nil {
-		defer func() { _ = lrdb.Close() }()
-		hooks = append(hooks, scheduler.ReleaseHook(scheduler.NewRedisLocker(lrdb), appLog.Errorf))
+	if lockRedisClient := lockRedis(config); lockRedisClient != nil {
+		defer func() { _ = lockRedisClient.Close() }()
+		hooks = append(hooks, scheduler.ReleaseHook(scheduler.NewRedisLocker(lockRedisClient), appLog.Errorf))
 	}
 	// Buried jobs persist to failed_jobs when a database is reachable: the
 	// broker's own handle when database-backed, else a best-effort dial
 	// (log-only burial when unreachable, as before).
 	var buried []queue.OnBuried
-	failedDB := db
-	if failedDB == nil {
-		if fdb, err := database.Connect(cfg.Database.Driver, cfg.Database.DSN()); err == nil {
+	failedDatabase := databaseConnection
+	if failedDatabase == nil {
+		if dialedDatabase, err := database.Connect(config.Database.Driver, config.Database.DSN()); err == nil {
 			defer func() {
-				if sqlDB, err := fdb.DB(); err == nil {
-					_ = sqlDB.Close()
+				if sqlDatabase, err := dialedDatabase.DB(); err == nil {
+					_ = sqlDatabase.Close()
 				}
 			}()
-			failedDB = fdb
+			failedDatabase = dialedDatabase
 		}
 	}
-	if failedDB != nil {
-		buried = append(buried, queue.RecordHook(queue.NewDatabaseFailedStore(failedDB), cfg.Queue.Connection, appLog.Errorf))
+	if failedDatabase != nil {
+		buried = append(buried, queue.RecordHook(queue.NewDatabaseFailedStore(failedDatabase), config.Queue.Connection, appLog.Errorf))
 	} else {
 		appLog.Info("buried jobs log only: no database for failed_jobs")
 	}
-	appLog.Info("worker listening", "connection", cfg.Queue.Connection)
+	appLog.Info("worker listening", "connection", config.Queue.Connection)
 	return queue.RunBuried(ctx, q, queue.Default(), appLog.Errorf, buried, hooks...)
 }

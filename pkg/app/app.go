@@ -16,17 +16,10 @@ import (
 
 	"github.com/gin-contrib/gzip"
 	"github.com/gin-gonic/gin"
-	swaggerFiles "github.com/swaggo/files"
-	ginSwagger "github.com/swaggo/gin-swagger"
 	"gorm.io/gorm"
 	gormlogger "gorm.io/gorm/logger"
 
-	"github.com/idehen-divine/GinPlate/internal/mail"
-	"github.com/idehen-divine/GinPlate/internal/mail/welcome"
-	"github.com/idehen-divine/GinPlate/internal/modules/auth"
-	"github.com/idehen-divine/GinPlate/internal/modules/notifications"
-	"github.com/idehen-divine/GinPlate/internal/modules/users"
-	"github.com/idehen-divine/GinPlate/pkg/config"
+	configPkg "github.com/idehen-divine/GinPlate/pkg/config"
 	"github.com/idehen-divine/GinPlate/pkg/database"
 	"github.com/idehen-divine/GinPlate/pkg/logger"
 	pkgmail "github.com/idehen-divine/GinPlate/pkg/mail"
@@ -51,12 +44,20 @@ func storageRoutePath(publicURL string) string {
 	return "/storage"
 }
 
-// openNotifyQueue builds the queue behind notification dispatch: sync runs
-// the notification.send job inline, database/redis persist it for the
-// worker. Notification delivery may fall back to synchronous dispatch when
-// Redis is unavailable; authentication sessions never fall back to
-// untracked tokens. Unknown backends fail fast via queue.Open.
-func openNotifyQueue(cfg *config.Config, db *gorm.DB, rdb *redis.Client, deps notify.Deps, warnf func(msg string, args ...any)) (queue.Queue, error) {
+// QueueResources owns the notification dispatch queue plus any Redis client
+// opened for it, so shutdown closes exactly what startup created.
+type QueueResources struct {
+	Queue queue.Queue
+	Close func() error
+}
+
+func noopClose() error { return nil }
+
+// openNotifyQueue builds the queue behind notification dispatch (sync runs
+// inline, database/redis persist for the worker). An explicitly configured
+// redis backend that is unreachable fails startup instead of silently
+// dispatching inline: delivery semantics must not change on outage.
+func openNotifyQueue(config *configPkg.Config, databaseConnection *gorm.DB, redisClient *redis.Client, deps notify.Deps) (QueueResources, error) {
 	reg := queue.NewRegistry()
 	notify.Register(reg, deps)
 	// The same registry also serves direct mail queueing (appmail.Queue):
@@ -64,27 +65,44 @@ func openNotifyQueue(cfg *config.Config, db *gorm.DB, rdb *redis.Client, deps no
 	if deps.Sender != nil {
 		pkgmail.Register(reg, deps.Sender)
 	}
-	switch cfg.Queue.Connection {
+	switch config.Queue.Connection {
 	case "", "sync":
-		return queue.NewSync(reg), nil
+		return QueueResources{Queue: queue.NewSync(reg), Close: noopClose}, nil
 	case "database":
-		return queue.Open(cfg.Queue, db, nil)
+		q, err := queue.Open(config.Queue, databaseConnection, nil)
+		return QueueResources{Queue: q, Close: noopClose}, err
 	case "redis":
-		if rdb == nil {
-			rdb = redisPkg.DialOrNil(cfg.Database.Redis, 2*time.Second)
-			if rdb == nil {
-				warnf("redis unreachable, notifications dispatch inline",
-					"addr", cfg.Database.Redis.Addr())
-				return queue.NewSync(reg), nil
+		if redisClient == nil {
+			owned := redisPkg.DialOrNil(config.Database.Redis, 2*time.Second)
+			if owned == nil {
+				return QueueResources{}, fmt.Errorf("notify queue: redis unreachable at %s (QUEUE_CONNECTION=redis)", config.Database.Redis.Addr())
 			}
+			q, err := queue.Open(config.Queue, databaseConnection, owned)
+			if err != nil {
+				_ = owned.Close()
+				return QueueResources{}, err
+			}
+			return QueueResources{Queue: q, Close: owned.Close}, nil
 		}
-		return queue.Open(cfg.Queue, db, rdb)
+		q, err := queue.Open(config.Queue, databaseConnection, redisClient)
+		return QueueResources{Queue: q, Close: noopClose}, err
 	default:
-		return queue.Open(cfg.Queue, db, rdb)
+		q, err := queue.Open(config.Queue, databaseConnection, redisClient)
+		return QueueResources{Queue: q, Close: noopClose}, err
 	}
 }
 
-// GormLogLevel maps DB_LOG_MODE to a GORM log level.
+// dbPool maps the shared pool bounds from config (replicas share one
+// database: size for replica count, not one process).
+func dbPool(config *configPkg.Config) database.Pool {
+	return database.Pool{
+		MaxOpen:     config.Database.MaxOpenConns,
+		MaxIdle:     config.Database.MaxIdleConns,
+		MaxLifetime: time.Duration(config.Database.ConnMaxLifetime) * time.Second,
+		MaxIdleTime: time.Duration(config.Database.ConnMaxIdleTime) * time.Second,
+	}
+}
+
 func GormLogLevel(mode string) gormlogger.LogLevel {
 	switch strings.ToLower(strings.TrimSpace(mode)) {
 	case "info":
@@ -98,204 +116,137 @@ func GormLogLevel(mode string) gormlogger.LogLevel {
 	}
 }
 
-// RunAPI starts the HTTP server with graceful shutdown. It blocks until
-// SIGINT/SIGTERM and returns nil on clean shutdown.
-func RunAPI(cfg *config.Config) error {
-	if cfg == nil {
+func RunAPI(config *configPkg.Config) error {
+	if config == nil {
 		return fmt.Errorf("nil config")
 	}
-	appLog := logger.New(cfg.App.Env, cfg.Logging.Level, cfg.Logging.Output)
+	appLog := logger.New(config.App.Env, config.Logging.Level, config.Logging.Output)
 	defer appLog.Sync()
 
-	// Production guardrails: misconfiguration must scream at boot, not in
-	// an incident. Debug detail + live docs + chatty drivers are dev tools.
-	if strings.EqualFold(cfg.App.Env, "production") || strings.EqualFold(cfg.App.Env, "prod") {
-		if cfg.App.Debug {
-			return fmt.Errorf("refusing to boot: APP_DEBUG=true with APP_ENV=production")
+	// Hardened-environment guardrails: fail at boot, not in an incident.
+	if configPkg.IsHardenedEnv(config.App.Env) {
+		if config.App.Debug {
+			return fmt.Errorf("refusing to boot: APP_DEBUG=true with APP_ENV=%s (hardened)", config.App.Env)
 		}
-		if cfg.App.Swagger {
-			return fmt.Errorf("refusing to boot: ENABLE_SWAGGER=true with APP_ENV=production (gate behind an internal boundary or disable)")
+		if config.App.Swagger {
+			return fmt.Errorf("refusing to boot: ENABLE_SWAGGER=true with APP_ENV=%s (hardened; disable or gate behind an internal boundary)", config.App.Env)
 		}
-		if cfg.Database.LogMode == "info" {
-			return fmt.Errorf("refusing to boot: DB_LOG_MODE=info with APP_ENV=production (use warn or error)")
+		if config.Database.LogMode == "info" {
+			return fmt.Errorf("refusing to boot: DB_LOG_MODE=info with APP_ENV=%s (hardened; use warn or error)", config.App.Env)
 		}
-		if cfg.Mail.Mailer == "log" {
-			return fmt.Errorf("refusing to boot: MAIL_MAILER=log with APP_ENV=production (emails would be discarded)")
+		if config.Mail.Mailer == "log" {
+			return fmt.Errorf("refusing to boot: MAIL_MAILER=log with APP_ENV=%s (hardened; emails would be discarded)", config.App.Env)
 		}
-		if len(cfg.App.HTTP.CORSOrigins()) == 0 {
-			return fmt.Errorf("refusing to boot: CORS_ALLOWED_ORIGINS empty with APP_ENV=production")
+		if len(config.App.HTTP.CORSOrigins()) == 0 {
+			return fmt.Errorf("refusing to boot: CORS_ALLOWED_ORIGINS empty with APP_ENV=%s (hardened)", config.App.Env)
 		}
-		u, err := url.Parse(strings.TrimSpace(cfg.App.URL))
+		u, err := url.Parse(strings.TrimSpace(config.App.URL))
 		if err != nil || !strings.EqualFold(u.Scheme, "https") {
-			return fmt.Errorf("refusing to boot: APP_URL must be https with APP_ENV=production")
+			return fmt.Errorf("refusing to boot: APP_URL must be https with APP_ENV=%s (hardened)", config.App.Env)
 		}
 	}
 
-	db, err := database.Connect(cfg.Database.Driver, cfg.Database.DSN(), appLog.GormLogger(GormLogLevel(cfg.Database.LogMode), 0))
+	databaseConnection, err := database.ConnectPool(config.Database.Driver, config.Database.DSN(), dbPool(config), appLog.GormLogger(GormLogLevel(config.Database.LogMode), 0))
 	if err != nil {
 		return fmt.Errorf("database: %w", err)
 	}
-	sqlDB, err := db.DB()
+	sqlDatabase, err := databaseConnection.DB()
 	if err != nil {
 		return fmt.Errorf("database: %w", err)
 	}
-	defer sqlDB.Close()
-	var rdb *redis.Client
-	if cfg.Session.Driver == "redis" {
-		rdb = redisPkg.DialOrNil(cfg.Database.Redis, 2*time.Second)
-		if rdb == nil {
-			// Fail closed in every environment: without the session
-			// backend, logout and revocation silently stop working.
-			// session.Open enforces the same rule; this message adds
-			// the address for operability.
-			return fmt.Errorf("session backend unavailable: redis unreachable at %s", cfg.Database.Redis.Addr())
+	defer sqlDatabase.Close()
+	var redisClient *redis.Client
+	if config.Session.Driver == "redis" {
+		redisClient = redisPkg.DialOrNil(config.Database.Redis, 2*time.Second)
+		if redisClient == nil {
+			// Fail closed: without the session backend, logout and
+			// revocation silently stop working.
+			return fmt.Errorf("session backend unavailable: redis unreachable at %s", config.Database.Redis.Addr())
 		}
-		defer rdb.Close()
+		defer redisClient.Close()
 	}
-	store, err := session.Open(cfg.Session.Driver, db, rdb, "")
+	store, err := session.Open(config.Session.Driver, databaseConnection, redisClient, "")
 	if err != nil {
 		return fmt.Errorf("session store: %w", err)
 	}
 
-	if !cfg.App.Debug {
+	if !config.App.Debug {
 		gin.SetMode(gin.ReleaseMode)
 	}
-	web.SetDebug(cfg.App.Debug)
+	web.SetDebug(config.App.Debug)
 	router := gin.New()
 	router.Use(gin.LoggerWithWriter(appLog.GinWriter()), web.Recovery(appLog.Errorf))
-	router.Use(web.Maintenance(cfg.App.Maintenance.Path))
+	router.Use(web.Maintenance(config.App.Maintenance.Path))
 
-	router.Use(httpmw.CORS(httpmw.CORSConfig{AllowedOrigins: cfg.App.HTTP.CORSOrigins(), AllowCredentials: true}))
+	router.Use(httpmw.CORS(httpmw.CORSConfig{AllowedOrigins: config.App.HTTP.CORSOrigins(), AllowCredentials: true}))
 	router.Use(httpmw.Security())
-	if cfg.App.HTTP.EnableGzip {
+	if config.App.HTTP.EnableGzip {
 		router.Use(gzip.Gzip(gzip.DefaultCompression))
 	}
-	if cfg.App.HTTP.RateLimitRPS > 0 {
-		router.Use(httpmw.RateLimit(cfg.App.HTTP.RateLimitRPS))
+	if config.App.HTTP.RateLimitRPS > 0 {
+		router.Use(httpmw.RateLimit(config.App.HTTP.RateLimitRPS))
+	}
+	if config.App.HTTP.MaxBodyBytes > 0 {
+		router.Use(httpmw.MaxBodyBytes(config.App.HTTP.MaxBodyBytes))
 	}
 
-	router.Use(web.ProvideDB(db))
+	router.Use(web.ProvideDB(databaseConnection))
 
-	v1 := router.Group("/api/v1")
-	{
-		key, err := cfg.Auth.JWT.KeyBytes()
-		if err != nil {
-			return err
-		}
-		sender, err := pkgmail.OpenSender(cfg.Mail, cfg.Filesystem.S3)
-		if err != nil {
-			return fmt.Errorf("mail: %w", err)
-		}
-		notifier := notify.NewNotifier(db, sender)
-		notifQueue, err := openNotifyQueue(cfg, db, rdb, notify.Deps{DB: db, Sender: sender}, appLog.Warnf)
-		if err != nil {
-			return fmt.Errorf("notify queue: %w", err)
-		}
-		authSvc := auth.NewService(key, cfg.Auth.JWT.AccessTTLMin, store).WithMailer(sender)
-		authSvc.WithNotifications(notifier, notifQueue, cfg.App.Name, cfg.App.URL)
-		auth.RegisterRoutes(v1, auth.NewHandler(authSvc), key, store)
-		// Explicit production wiring: repositories are constructed here so
-		// misconfiguration surfaces at boot, not at first request.
-		users.RegisterRoutes(v1, users.NewHandler(users.NewService(users.NewGormRepository())), key, store)
-		notifications.RegisterRoutes(v1, notifications.NewHandler(notifications.NewService(notify.NewStore(db))), key, store)
-		// Dev-only mail preview: admin JWT required, 404s outside debug.
-		appmail.RegisterPreviewRoutes(v1, sender, key, store, cfg.App.Debug,
-			func(to string) pkgmail.Mailable {
-				return welcome.Welcome{AppName: cfg.App.Name, Name: "Preview", Email: to, AppURL: cfg.App.URL}
-			})
+	key, err := config.Auth.JWT.KeyBytes()
+	if err != nil {
+		return err
 	}
-
-	router.NoRoute(func(c *gin.Context) {
-		web.Render(c, web.NotFound("Not found."))
-	})
-	// Liveness: process is alive, no dependency queries.
-	router.GET("/livez", func(c *gin.Context) {
-		web.Success(c, http.StatusOK, "ok", gin.H{})
-	})
-	// Readiness: database and (when configured) Redis are reachable with a
-	// bounded timeout; failure is 503 so orchestrators stop routing here.
-	router.GET("/readyz", func(c *gin.Context) {
-		ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
-		defer cancel()
-		if err := sqlDB.PingContext(ctx); err != nil {
-			web.Fail(c, http.StatusServiceUnavailable, "Not ready.", nil)
-			return
-		}
-		if rdb != nil {
-			if err := rdb.Ping(ctx).Err(); err != nil {
-				web.Fail(c, http.StatusServiceUnavailable, "Not ready.", nil)
-				return
-			}
-		}
-		web.Success(c, http.StatusOK, "ok", gin.H{})
-	})
-	router.GET("/health", func(c *gin.Context) {
-		data := gin.H{}
-		// Queue depth + burial count when the tables exist (fresh,
-		// unmigrated databases report status only, never 500).
-		if db.Migrator().HasTable("jobs") {
-			var depth int64
-			if err := db.Table("jobs").Where("available_at <= ?", time.Now()).Count(&depth).Error; err == nil {
-				data["queue_depth"] = depth
-			}
-		}
-		if db.Migrator().HasTable("failed_jobs") {
-			var failed int64
-			if err := db.Table("failed_jobs").Count(&failed).Error; err == nil {
-				data["failed_jobs"] = failed
-			}
-		}
-		web.Success(c, http.StatusOK, "ok", data)
-	})
-	// Minimal Prometheus-style metrics (no extra dependency): queue depth,
-	// burial count, and process uptime. Scrape separately from health so
-	// slow metadata queries never affect liveness/readiness.
-	router.GET("/metrics", func(c *gin.Context) {
-		var depth, failed int64
-		if db.Migrator().HasTable("jobs") {
-			_ = db.Table("jobs").Where("available_at <= ?", time.Now()).Count(&depth).Error
-		}
-		if db.Migrator().HasTable("failed_jobs") {
-			_ = db.Table("failed_jobs").Count(&failed).Error
-		}
-		c.Header("Content-Type", "text/plain; version=0.0.4")
-		c.String(http.StatusOK, "# HELP ginplate_queue_depth Due jobs awaiting a worker.\n"+
-			"# TYPE ginplate_queue_depth gauge\nginplate_queue_depth %d\n"+
-			"# HELP ginplate_failed_jobs Buried jobs awaiting retry or deletion.\n"+
-			"# TYPE ginplate_failed_jobs gauge\nginplate_failed_jobs %d\n",
-			depth, failed)
-	})
-	// Public disk files, world-readable: what disk.URL() returns for the
-	// public disk resolves here. Private local files and s3 objects never
-	// touch this route (s3 uses presigned links).
-	router.Static(storageRoutePath(cfg.Filesystem.PublicURL), cfg.Filesystem.PublicRoot)
-	if cfg.App.Swagger {
-		router.GET("/swagger/*any", ginSwagger.WrapHandler(swaggerFiles.Handler))
+	sender, err := pkgmail.OpenSender(config.Mail, config.Filesystem.S3)
+	if err != nil {
+		return fmt.Errorf("mail: %w", err)
 	}
+	notifier := notify.NewNotifier(databaseConnection, sender)
+	queueRes, err := openNotifyQueue(config, databaseConnection, redisClient, notify.Deps{DB: databaseConnection, Sender: sender})
+	if err != nil {
+		return fmt.Errorf("notify queue: %w", err)
+	}
+	defer func() { _ = queueRes.Close() }()
+	notifQueue := queueRes.Queue
+	// Custom globals self-register via init()
+	// (web.RegisterGlobalMiddleware) and run after all built-ins above,
+	// so ProvideDB is already in place. Adding one = adding one file in
+	// internal/middleware, no edit here.
+	deps := &web.ModuleDeps{
+		DB: databaseConnection, Key: key, Store: store, Sender: sender,
+		Notifier: notifier, Queue: notifQueue,
+		Debug: config.App.Debug, AppName: config.App.Name, AppURL: config.App.URL,
+		AccessTTLMin: config.Auth.JWT.AccessTTLMin,
+	}
+	for _, m := range web.RegisteredGlobalMiddlewares() {
+		m.Fn(router, deps)
+	}
+	// Modules self-register via init(); see internal/modules/register.go.
+	RegisterAPIRoutes(router, deps)
+	RegisterInfraRoutes(router, databaseConnection, sqlDatabase, redisClient, config.Filesystem.PublicURL, config.Filesystem.PublicRoot, config.App.Swagger, config.App.Metrics)
 
 	srv := &http.Server{
-		Addr:         ":" + cfg.App.Port,
+		Addr:         ":" + config.App.Port,
 		Handler:      router,
-		ReadTimeout:  time.Duration(cfg.App.HTTP.ReadTimeoutSec) * time.Second,
-		WriteTimeout: time.Duration(cfg.App.HTTP.WriteTimeoutSec) * time.Second,
-		IdleTimeout:  time.Duration(cfg.App.HTTP.IdleTimeoutSec) * time.Second,
+		ReadTimeout:  time.Duration(config.App.HTTP.ReadTimeoutSec) * time.Second,
+		WriteTimeout: time.Duration(config.App.HTTP.WriteTimeoutSec) * time.Second,
+		IdleTimeout:  time.Duration(config.App.HTTP.IdleTimeoutSec) * time.Second,
 	}
 
 	errCh := make(chan error, 1)
 	go func() {
 		appLog.Info("ginplate boot",
-			"env", cfg.App.Env, "debug", cfg.App.Debug,
-			"database", cfg.Database.Driver, "session", cfg.Session.Driver,
-			"queue", cfg.Queue.Connection, "tries", cfg.Queue.Tries,
-			"cache", cfg.Cache.Store, "mailer", cfg.Mail.Mailer,
-			"swagger", cfg.App.Swagger)
+			"env", config.App.Env, "debug", config.App.Debug,
+			"database", config.Database.Driver, "session", config.Session.Driver,
+			"queue", config.Queue.Connection, "tries", config.Queue.Tries,
+			"cache", config.Cache.Store, "mailer", config.Mail.Mailer,
+			"swagger", config.App.Swagger)
 		var err error
-		if cfg.App.HTTP.TLSCertFile != "" && cfg.App.HTTP.TLSKeyFile != "" {
-			appLog.Info("ginplate listening with TLS", "port", cfg.App.Port)
-			err = srv.ListenAndServeTLS(cfg.App.HTTP.TLSCertFile, cfg.App.HTTP.TLSKeyFile)
+		if config.App.HTTP.TLSCertFile != "" && config.App.HTTP.TLSKeyFile != "" {
+			appLog.Info("ginplate listening with TLS", "port", config.App.Port)
+			err = srv.ListenAndServeTLS(config.App.HTTP.TLSCertFile, config.App.HTTP.TLSKeyFile)
 		} else {
-			appLog.Info("ginplate listening", "port", cfg.App.Port)
-			if strings.EqualFold(cfg.App.Env, "production") || strings.EqualFold(cfg.App.Env, "prod") {
+			appLog.Info("ginplate listening", "port", config.App.Port)
+			if strings.EqualFold(config.App.Env, "production") || strings.EqualFold(config.App.Env, "prod") {
 				appLog.Info("TLS terminates at the reverse proxy; APP_URL must be https")
 			}
 			err = srv.ListenAndServe()
@@ -315,10 +266,8 @@ func RunAPI(cfg *config.Config) error {
 	case <-quit:
 		appLog.Info("shutting down gracefully...")
 	}
-	// Coordinated shutdown: stop accepting HTTP, then close shared handles
-	// in dependency order so in-flight background work is not left writing
-	// to closed dependencies.
-	timeout := cfg.App.HTTP.ShutdownTimeoutSec
+	// Coordinated shutdown: stop accepting HTTP before closing dependencies.
+	timeout := config.App.HTTP.ShutdownTimeoutSec
 	if timeout <= 0 {
 		timeout = 5
 	}

@@ -11,7 +11,7 @@ import (
 )
 
 // TestApp is the single entry point for every app test: storage route-path
-// mapping and static file serving.
+// mapping, static file serving, and the metrics toggle.
 func TestApp(t *testing.T) {
 	t.Run("storage-route-path", func(t *testing.T) {
 		cases := map[string]string{
@@ -56,6 +56,31 @@ func TestApp(t *testing.T) {
 		}
 		if w := get("/storage/../app.go"); w.Code == http.StatusOK {
 			t.Fatal("escape served with 200")
+		}
+	})
+
+	t.Run("metrics-toggle", func(t *testing.T) {
+		gin.SetMode(gin.TestMode)
+		get := func(router *gin.Engine, target string) *httptest.ResponseRecorder {
+			w := httptest.NewRecorder()
+			router.ServeHTTP(w, httptest.NewRequest("GET", target, nil))
+			return w
+		}
+		on := gin.New()
+		RegisterInfraRoutes(on, nil, nil, nil, "/storage", t.TempDir(), false, true)
+		if w := get(on, "/metrics"); w.Code != http.StatusOK {
+			t.Fatalf("enabled metrics = %d, want 200", w.Code)
+		}
+		if w := get(on, "/livez"); w.Code != http.StatusOK {
+			t.Fatalf("livez = %d, want 200", w.Code)
+		}
+		off := gin.New()
+		RegisterInfraRoutes(off, nil, nil, nil, "/storage", t.TempDir(), false, false)
+		if w := get(off, "/metrics"); w.Code != http.StatusNotFound {
+			t.Fatalf("disabled metrics = %d, want 404", w.Code)
+		}
+		if w := get(off, "/livez"); w.Code != http.StatusOK {
+			t.Fatalf("livez = %d, want 200", w.Code)
 		}
 	})
 }
