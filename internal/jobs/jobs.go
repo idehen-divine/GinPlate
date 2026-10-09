@@ -1,8 +1,6 @@
-// Package jobs holds application background-job handlers. Register each
-// handler in init() via queue.Handle, and each recurring push via
-// scheduler.Schedule: the queue:work and schedule:work commands blank-import
-// this package, so both attach with no manual wiring. Copy LogHello to add
-// your own, or run `ginplate make:job Billing.Charge`.
+// Package jobs holds background-job handlers. Register handlers via
+// queue.Handle and recurring pushes via scheduler.Schedule in init()
+// (or run `ginplate make:job`).
 package jobs
 
 import (
@@ -31,48 +29,42 @@ func init() {
 	)
 }
 
-// SendMail delivers a mail.send job through the configured MAIL_MAILER.
-// Deps resolve lazily from config per job so the worker needs no extra
-// wiring; failures return errors for retry.
+// SendMail delivers a mail.send job (deps resolve lazily per job).
 func SendMail(ctx context.Context, job queue.Job) error {
-	cfg, err := config.Load()
+	config, err := config.Load()
 	if err != nil {
 		return err
 	}
-	sender, err := mail.OpenSender(cfg.Mail, cfg.Filesystem.S3)
+	sender, err := mail.OpenSender(config.Mail, config.Filesystem.S3)
 	if err != nil {
 		return err
 	}
 	return mail.HandlerFor(sender)(ctx, job)
 }
 
-// SendNotification delivers a notification.send job: the database row is
-// written first, then mail sends. Deps resolve lazily from config per job
-// so the worker needs no extra wiring; failures return errors for retry.
+// SendNotification delivers a notification.send job (row first, then mail).
 func SendNotification(ctx context.Context, job queue.Job) error {
-	cfg, err := config.Load()
+	config, err := config.Load()
 	if err != nil {
 		return err
 	}
-	db, err := database.Connect(cfg.Database.Driver, cfg.Database.DSN())
+	databaseConnection, err := database.Connect(config.Database.Driver, config.Database.DSN())
 	if err != nil {
 		return err
 	}
-	sqlDB, err := db.DB()
+	sqlDatabase, err := databaseConnection.DB()
 	if err != nil {
 		return err
 	}
-	defer sqlDB.Close()
-	sender, err := mail.OpenSender(cfg.Mail, cfg.Filesystem.S3)
+	defer sqlDatabase.Close()
+	sender, err := mail.OpenSender(config.Mail, config.Filesystem.S3)
 	if err != nil {
 		return err
 	}
-	return notify.HandlerFor(notify.Deps{DB: db, Sender: sender})(ctx, job)
+	return notify.HandlerFor(notify.Deps{DB: databaseConnection, Sender: sender})(ctx, job)
 }
 
-// LogHello is the example handler: it logs its payload and succeeds. Push
-// one from code via a Queue, e.g. q.Push(ctx, "log.hello", []byte(`{"to":"world"}`)).
-// Scheduled payloads unwrap with scheduler.Data (plain pushes pass through).
+// LogHello is the example handler.
 func LogHello(ctx context.Context, job queue.Job) error {
 	var payload struct {
 		To string `json:"to"`

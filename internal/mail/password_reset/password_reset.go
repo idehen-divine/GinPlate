@@ -1,5 +1,4 @@
-// Package passwordreset is the forgot-password mailable: its struct beside
-// its template, so the whole email lives in this directory.
+// Package passwordreset is the forgot-password mailable.
 package passwordreset
 
 import (
@@ -7,19 +6,14 @@ import (
 	"fmt"
 	"strings"
 
-	appmail "github.com/idehen-divine/GinPlate/internal/mail"
 	pkgmail "github.com/idehen-divine/GinPlate/pkg/mail"
 )
 
 //go:embed *.html
 var templateFS embed.FS
 
-// PasswordReset carries a forgot-password email: Token becomes a link under
-// AppURL (e.g. https://app.com/reset-password?token=...). The caller
-// persists the token row (see the password_reset_tokens table) then sends
-// or queues this mailable:
-//
-//	appmail.Send(ctx, sender, user.Email, passwordreset.PasswordReset{...})
+// PasswordReset carries a forgot-password email. The caller persists the
+// token row, then sends or queues this mailable.
 type PasswordReset struct {
 	AppURL         string
 	Name           string
@@ -28,7 +22,6 @@ type PasswordReset struct {
 	ExpiresMinutes int
 }
 
-// Build renders password_reset.html into a ready-to-send Message.
 func (p PasswordReset) Build() (pkgmail.Message, error) {
 	if strings.TrimSpace(p.Email) == "" || strings.TrimSpace(p.Token) == "" {
 		return pkgmail.Message{}, fmt.Errorf("mail: email and token are required")
@@ -38,7 +31,7 @@ func (p PasswordReset) Build() (pkgmail.Message, error) {
 		expires = 60
 	}
 	resetURL := strings.TrimSuffix(strings.TrimSpace(p.AppURL), "/") + "/reset-password?token=" + p.Token
-	html, err := appmail.RenderFS(templateFS, "password_reset", map[string]any{
+	html, err := pkgmail.RenderFS(templateFS, "password_reset", map[string]any{
 		"Name":           p.Name,
 		"Email":          p.Email,
 		"ResetURL":       resetURL,

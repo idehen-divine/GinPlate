@@ -11,7 +11,6 @@ import (
 	"gorm.io/gorm"
 )
 
-// Item is one inbox row for API responses.
 type Item struct {
 	ID        uuid.UUID      `json:"id"`
 	Type      string         `json:"type"`
@@ -20,17 +19,21 @@ type Item struct {
 	CreatedAt string         `json:"created_at"`
 }
 
-// ListResult is the inbox page plus the unread badge count.
 type ListResult struct {
 	Notifications web.ListResult[Item] `json:"notifications"`
 	Unread        int64                `json:"unread"`
 }
 
-// Service is the inbox logic over a notify Store (mockable in tests).
+// NotificationService is the behavior boundary handlers depend on.
+type NotificationService interface {
+	List(ctx context.Context, db *gorm.DB, to notify.Notifiable, filter web.ListFilter) (ListResult, error)
+	Read(ctx context.Context, db *gorm.DB, to notify.Notifiable, id uuid.UUID) error
+	ReadAll(ctx context.Context, db *gorm.DB, to notify.Notifiable) error
+}
+
 type Service struct{ store notify.Store }
 
-// NewService wires a Store to the Service. A nil store selects the GORM
-// implementation around the request DB, so callers only pass one in tests.
+// NewService wires a Store; nil selects the GORM implementation.
 func NewService(store notify.Store) *Service { return &Service{store: store} }
 
 func (s *Service) storeFor(db *gorm.DB) notify.Store {
@@ -55,10 +58,9 @@ func toItem(r notify.Record) Item {
 	}
 }
 
-// List returns the notifiable's inbox page plus the unread count.
-func (s *Service) List(ctx context.Context, db *gorm.DB, to notify.Notifiable, f web.ListFilter) (ListResult, error) {
+func (s *Service) List(ctx context.Context, db *gorm.DB, to notify.Notifiable, filter web.ListFilter) (ListResult, error) {
 	store := s.storeFor(db)
-	rows, total, err := store.List(ctx, to, f.Limit, f.Offset)
+	rows, total, err := store.List(ctx, to, filter.Limit, filter.Offset)
 	if err != nil {
 		return ListResult{}, web.Wrap(http.StatusInternalServerError, "Could not list notifications.", err)
 	}
@@ -70,12 +72,11 @@ func (s *Service) List(ctx context.Context, db *gorm.DB, to notify.Notifiable, f
 	for _, r := range rows {
 		items = append(items, toItem(r))
 	}
-	return ListResult{Notifications: web.PagedResult(items, total, f), Unread: unread}, nil
+	return ListResult{Notifications: web.PagedResult(items, total, filter), Unread: unread}, nil
 }
 
-// Read marks one row read. Missing rows — or rows belonging to another
-// notifiable, which the scoping makes indistinguishable — surface
-// gorm.ErrRecordNotFound so handlers render 404.
+// Read marks one row read. Cross-user rows are indistinguishable from
+// missing ones (404 either way).
 func (s *Service) Read(ctx context.Context, db *gorm.DB, to notify.Notifiable, id uuid.UUID) error {
 	if err := s.storeFor(db).MarkRead(ctx, to, id); err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -86,7 +87,6 @@ func (s *Service) Read(ctx context.Context, db *gorm.DB, to notify.Notifiable, i
 	return nil
 }
 
-// ReadAll marks every unread row read.
 func (s *Service) ReadAll(ctx context.Context, db *gorm.DB, to notify.Notifiable) error {
 	if err := s.storeFor(db).MarkAllRead(ctx, to); err != nil {
 		return web.Wrap(http.StatusInternalServerError, "Could not mark notifications read.", err)

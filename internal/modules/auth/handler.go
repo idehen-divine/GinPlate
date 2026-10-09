@@ -4,15 +4,14 @@ import (
 	"net/http"
 
 	"github.com/gin-gonic/gin"
+	"github.com/idehen-divine/GinPlate/internal/middleware"
 	"github.com/idehen-divine/GinPlate/pkg/web"
 )
 
-type Handler struct{ svc *Service }
+type Handler struct{ service AuthService }
 
-// NewHandler wires an auth Service to its HTTP handlers.
-func NewHandler(svc *Service) *Handler { return &Handler{svc: svc} }
+func NewHandler(service AuthService) *Handler { return &Handler{service: service} }
 
-// Signup registers a new member account.
 // @Summary Register
 // @Tags Auth
 // @Param payload body SignupDTO true "signup"
@@ -24,7 +23,7 @@ func (h *Handler) Signup(c *gin.Context) {
 		web.ValidationErrors(c, err)
 		return
 	}
-	u, err := h.svc.Register(web.MustDB(c), dto)
+	u, err := h.service.Register(web.MustDB(c), dto)
 	if err != nil {
 		web.Render(c, err)
 		return
@@ -32,7 +31,6 @@ func (h *Handler) Signup(c *gin.Context) {
 	web.Success(c, http.StatusCreated, "Registered.", gin.H{"id": u.ID, "email": u.Email, "role": u.Role})
 }
 
-// Login verifies credentials and issues a token pair.
 // @Summary Login (JWT + session)
 // @Tags Auth
 // @Param payload body LoginDTO true "login"
@@ -44,7 +42,7 @@ func (h *Handler) Login(c *gin.Context) {
 		web.ValidationErrors(c, err)
 		return
 	}
-	u, pair, err := h.svc.Login(web.MustDB(c), dto)
+	u, pair, err := h.service.Login(web.MustDB(c), dto)
 	if err != nil {
 		web.Render(c, err)
 		return
@@ -52,15 +50,14 @@ func (h *Handler) Login(c *gin.Context) {
 	web.Success(c, http.StatusOK, "Logged in.", gin.H{"user": gin.H{"id": u.ID, "email": u.Email, "role": u.Role}, "token": pair})
 }
 
-// Logout invalidates the current session token.
 // @Summary Logout (invalidate jti)
 // @Tags Auth
 // @Security Bearer
 // @Success 200 {object} map[string]interface{}
 // @Router /auth/logout [post]
 func (h *Handler) Logout(c *gin.Context) {
-	if cl := web.CurrentClaims(c); cl != nil {
-		if err := h.svc.Logout(cl.SessionID); err != nil {
+	if cl := middleware.CurrentClaims(c); cl != nil {
+		if err := h.service.Logout(cl.SessionID); err != nil {
 			web.Render(c, err)
 			return
 		}
@@ -68,17 +65,15 @@ func (h *Handler) Logout(c *gin.Context) {
 	web.Success(c, http.StatusOK, "Logged out.", nil)
 }
 
-// Me returns the authenticated caller's claims.
 // @Summary Current user
 // @Tags Auth
 // @Security Bearer
 // @Success 200 {object} map[string]interface{}
 // @Router /auth/me [get]
 func (h *Handler) Me(c *gin.Context) {
-	web.Success(c, http.StatusOK, "Me.", web.CurrentClaims(c))
+	web.Success(c, http.StatusOK, "Me.", middleware.CurrentClaims(c))
 }
 
-// Refresh rotates a refresh token into a new token pair.
 // @Summary Refresh access token (rotation)
 // @Tags Auth
 // @Param payload body RefreshDTO true "refresh"
@@ -90,7 +85,7 @@ func (h *Handler) Refresh(c *gin.Context) {
 		web.ValidationErrors(c, err)
 		return
 	}
-	u, pair, err := h.svc.Refresh(web.MustDB(c), dto.RefreshToken)
+	u, pair, err := h.service.Refresh(web.MustDB(c), dto.RefreshToken)
 	if err != nil {
 		web.Render(c, err)
 		return
@@ -98,7 +93,6 @@ func (h *Handler) Refresh(c *gin.Context) {
 	web.Success(c, http.StatusOK, "Refreshed.", gin.H{"user": gin.H{"id": u.ID, "email": u.Email, "role": u.Role}, "token": pair})
 }
 
-// Check reports whether a token is valid without side effects.
 // @Summary Validate a token without side effects
 // @Tags Auth
 // @Param payload body CheckDTO true "token"
@@ -110,10 +104,10 @@ func (h *Handler) Check(c *gin.Context) {
 		web.ValidationErrors(c, err)
 		return
 	}
-	res := h.svc.Check(dto.Token)
-	if !res.Valid {
+	result := h.service.Check(dto.Token)
+	if !result.Valid {
 		web.Render(c, web.Unauthorized("Invalid token."))
 		return
 	}
-	web.Success(c, http.StatusOK, "Token valid.", res)
+	web.Success(c, http.StatusOK, "Token valid.", result)
 }

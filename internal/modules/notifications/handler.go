@@ -5,25 +5,23 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/idehen-divine/GinPlate/internal/middleware"
 	"github.com/idehen-divine/GinPlate/pkg/notify"
 	"github.com/idehen-divine/GinPlate/pkg/web"
 )
 
-type Handler struct{ svc *Service }
+type Handler struct{ service NotificationService }
 
-// NewHandler wires a notifications Service to its HTTP handlers.
-func NewHandler(svc *Service) *Handler { return &Handler{svc: svc} }
+func NewHandler(service NotificationService) *Handler { return &Handler{service: service} }
 
-// notifiableFor scopes every call to the caller's own inbox.
 func notifiableFor(c *gin.Context) (notify.Notifiable, bool) {
-	cl := web.CurrentClaims(c)
+	cl := middleware.CurrentClaims(c)
 	if cl == nil {
 		return notify.Notifiable{}, false
 	}
 	return notify.Notifiable{Type: "user", ID: cl.UserID.String()}, true
 }
 
-// List serves the caller's paged inbox plus the unread count.
 // @Summary List my notifications (paged + unread count)
 // @Tags Notifications
 // @Security Bearer
@@ -35,15 +33,14 @@ func (h *Handler) List(c *gin.Context) {
 		web.Render(c, web.Unauthorized("Unauthenticated."))
 		return
 	}
-	res, err := h.svc.List(c.Request.Context(), web.MustDB(c), to, web.BindFilter(c))
+	result, err := h.service.List(c.Request.Context(), web.MustDB(c), to, web.BindFilter(c))
 	if err != nil {
 		web.Render(c, err)
 		return
 	}
-	web.Success(c, http.StatusOK, "Notifications.", res)
+	web.Success(c, http.StatusOK, "Notifications.", result)
 }
 
-// Read marks one inbox row read.
 // @Summary Mark a notification read
 // @Tags Notifications
 // @Security Bearer
@@ -61,14 +58,13 @@ func (h *Handler) Read(c *gin.Context) {
 		web.Render(c, web.BadRequest("Invalid notification id."))
 		return
 	}
-	if err := h.svc.Read(c.Request.Context(), web.MustDB(c), to, id); err != nil {
+	if err := h.service.Read(c.Request.Context(), web.MustDB(c), to, id); err != nil {
 		web.Render(c, err)
 		return
 	}
 	web.Success(c, http.StatusOK, "Notification marked read.", nil)
 }
 
-// ReadAll marks the whole inbox read.
 // @Summary Mark all notifications read
 // @Tags Notifications
 // @Security Bearer
@@ -80,7 +76,7 @@ func (h *Handler) ReadAll(c *gin.Context) {
 		web.Render(c, web.Unauthorized("Unauthenticated."))
 		return
 	}
-	if err := h.svc.ReadAll(c.Request.Context(), web.MustDB(c), to); err != nil {
+	if err := h.service.ReadAll(c.Request.Context(), web.MustDB(c), to); err != nil {
 		web.Render(c, err)
 		return
 	}
