@@ -10,6 +10,7 @@ import (
 
 	pkgmail "github.com/idehen-divine/GinPlate/pkg/mail"
 	"github.com/idehen-divine/GinPlate/pkg/queue"
+	"github.com/idehen-divine/GinPlate/pkg/tenancy"
 	"gorm.io/gorm"
 )
 
@@ -102,5 +103,11 @@ func (n *Notifier) Queue(ctx context.Context, q queue.Queue, to Notifiable, noti
 	if err != nil {
 		return "", err
 	}
-	return q.Push(ctx, JobName, mustMarshal(payload))
+	raw := mustMarshal(payload)
+	if slug, ok := tenancy.TenantSlugFrom(ctx); ok {
+		if raw, err = tenancy.WrapPayload(slug, raw); err != nil {
+			return "", err
+		}
+	}
+	return q.Push(ctx, JobName, raw)
 }

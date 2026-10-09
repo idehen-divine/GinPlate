@@ -7,6 +7,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/idehen-divine/GinPlate/internal/middleware"
 	"github.com/idehen-divine/GinPlate/pkg/web"
 	"gorm.io/gorm"
 )
@@ -20,6 +21,21 @@ type stubRepo struct {
 // List replays canned rows, total, and error without touching a database.
 func (s stubRepo) List(_ context.Context, _ *gorm.DB, _ web.ListFilter) ([]User, int64, error) {
 	return s.rows, s.total, s.err
+}
+
+// IncrementAuthVersion is a no-op stub satisfying the Repository seam.
+func (s stubRepo) IncrementAuthVersion(_ context.Context, _ *gorm.DB, _ uuid.UUID) error {
+	return s.err
+}
+
+// SetRole is a no-op stub satisfying the Repository seam.
+func (s stubRepo) SetRole(_ context.Context, _ *gorm.DB, _ uuid.UUID, _ string) error {
+	return s.err
+}
+
+// SetActive is a no-op stub satisfying the Repository seam.
+func (s stubRepo) SetActive(_ context.Context, _ *gorm.DB, _ uuid.UUID, _ bool) error {
+	return s.err
 }
 
 // TestUsers is the single entry point for every users service test: paged
@@ -48,9 +64,9 @@ func TestUsers(t *testing.T) {
 	t.Run("resource-gates-fields-by-role", func(t *testing.T) {
 		id := uuid.New()
 		user := User{ID: id, Name: "Ada", Email: "ada@example.com", Role: "member", IsActive: true}
-		admin := &web.Claims{UserID: uuid.New(), Role: "admin"}
-		self := &web.Claims{UserID: id, Role: "member"}
-		other := &web.Claims{UserID: uuid.New(), Role: "member"}
+		admin := &middleware.Claims{UserID: uuid.New(), Role: "admin"}
+		self := &middleware.Claims{UserID: id, Role: "member"}
+		other := &middleware.Claims{UserID: uuid.New(), Role: "member"}
 
 		selfView := NewUserResource(user, self).ToMap()
 		if selfView["email"] != "ada@example.com" {

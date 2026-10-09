@@ -345,6 +345,7 @@ func TestGormStoreLive(t *testing.T) {
 	}
 	if err := db.Exec(`CREATE TABLE notifications (
 		` + idCol + `,
+		tenant_id VARCHAR(36) NOT NULL DEFAULT '',
 		notifiable_type VARCHAR(64) NOT NULL,
 		notifiable_id VARCHAR(64) NOT NULL,
 		type VARCHAR(128) NOT NULL,

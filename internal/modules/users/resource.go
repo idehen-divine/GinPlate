@@ -36,6 +36,7 @@ func (r UserResource) ToMap() gin.H {
 		out["email"] = u.Email
 	}
 	if r.isAdmin() {
+		out["tenant_id"] = u.TenantID.String()
 		out["is_active"] = u.IsActive
 		out["created_at"] = u.CreatedAt
 		out["updated_at"] = u.UpdatedAt

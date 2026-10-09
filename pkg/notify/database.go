@@ -17,6 +17,7 @@ const (
 
 type Record struct {
 	ID             uuid.UUID  `gorm:"type:char(36);primaryKey" json:"id"`
+	TenantID       string     `gorm:"size:36;index;not null" json:"tenant_id"`
 	NotifiableType string     `gorm:"not null;index" json:"-"`
 	NotifiableID   string     `gorm:"not null;index" json:"-"`
 	Type           string     `gorm:"not null" json:"type"`
