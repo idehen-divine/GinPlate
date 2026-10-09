@@ -80,6 +80,8 @@ func (s *stubSessionStore) ReplaceRefresh(_ context.Context, oldRefreshJti, newA
 	return ajti, true, nil
 }
 
+func (s *stubSessionStore) RevokeUser(_ context.Context, _ string) error { return nil }
+
 func testCtx(t *testing.T, method, target string) (*gin.Context, *httptest.ResponseRecorder) {
 	t.Helper()
 	gin.SetMode(gin.TestMode)

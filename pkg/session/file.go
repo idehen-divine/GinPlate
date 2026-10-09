@@ -172,6 +172,35 @@ func (s *fileStore) Unlink(_ context.Context, accessJti, refreshJti string) erro
 	return nil
 }
 
+func (s *fileStore) RevokeUser(_ context.Context, userID string) error {
+	if userID == "" {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		accessJti := strings.TrimSuffix(e.Name(), ".json")
+		fs, ok := s.read(accessJti)
+		if !ok || fs.UserID != userID {
+			continue
+		}
+		if err := os.Remove(s.path(accessJti)); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	return nil
+}
+
 // ReplaceRefresh validates and replaces in one mutex-guarded step (fail
 // closed; single process only).
 func (s *fileStore) ReplaceRefresh(_ context.Context, oldRefreshJti, newAccessJti, newRefreshJti, userID string, accessTTL, refreshTTL time.Duration) (string, bool, error) {

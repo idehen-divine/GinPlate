@@ -5,12 +5,14 @@ import (
 	"errors"
 	"time"
 
+	"github.com/idehen-divine/GinPlate/pkg/tenancy"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
 
 type sessionRow struct {
 	ID               string    `gorm:"primaryKey;size:36"`
+	TenantID         string    `gorm:"column:tenant_id;size:36;index;not null;default:''"`
 	RefreshJTI       string    `gorm:"column:refresh_jti;size:36;uniqueIndex;not null"`
 	UserID           string    `gorm:"column:user_id;size:36;index"`
 	AccessExpiresAt  time.Time `gorm:"column:access_expires_at;not null"`
@@ -30,13 +32,25 @@ func Database(db *gorm.DB) Store {
 	return &databaseStore{db: db, now: time.Now}
 }
 
+func tenantScope(db *gorm.DB, ctx context.Context) *gorm.DB {
+	if id, ok := tenancy.TenantIDFrom(ctx); ok {
+		return db.Where("tenant_id = ?", id.String())
+	}
+	return db
+}
+
 func (s *databaseStore) Link(ctx context.Context, accessJti, refreshJti, userID string, accessTTL, refreshTTL time.Duration) error {
 	if accessJti == "" || refreshJti == "" {
 		return errEmptySessionID
 	}
 	now := s.now()
+	tenantID := ""
+	if id, ok := tenancy.TenantIDFrom(ctx); ok {
+		tenantID = id.String()
+	}
 	row := sessionRow{
 		ID:               accessJti,
+		TenantID:         tenantID,
 		RefreshJTI:       refreshJti,
 		UserID:           userID,
 		AccessExpiresAt:  now.Add(accessTTL),
@@ -55,11 +69,11 @@ func (s *databaseStore) AccessValid(ctx context.Context, accessJti string) (stri
 		return "", false
 	}
 	var row sessionRow
-	if err := s.db.WithContext(ctx).Where("id = ?", accessJti).First(&row).Error; err != nil {
+	if err := tenantScope(s.db.WithContext(ctx), ctx).Where("id = ?", accessJti).First(&row).Error; err != nil {
 		return "", false
 	}
 	if !s.now().Before(row.AccessExpiresAt) {
-		_ = s.db.WithContext(ctx).Where("id = ?", accessJti).Delete(&sessionRow{}).Error
+		_ = tenantScope(s.db.WithContext(ctx), ctx).Where("id = ?", accessJti).Delete(&sessionRow{}).Error
 		return "", false
 	}
 	return row.RefreshJTI, true
@@ -70,11 +84,11 @@ func (s *databaseStore) RefreshValid(ctx context.Context, refreshJti string) (st
 		return "", false
 	}
 	var row sessionRow
-	if err := s.db.WithContext(ctx).Where("refresh_jti = ?", refreshJti).First(&row).Error; err != nil {
+	if err := tenantScope(s.db.WithContext(ctx), ctx).Where("refresh_jti = ?", refreshJti).First(&row).Error; err != nil {
 		return "", false
 	}
 	if !s.now().Before(row.RefreshExpiresAt) {
-		_ = s.db.WithContext(ctx).Where("refresh_jti = ?", refreshJti).Delete(&sessionRow{}).Error
+		_ = tenantScope(s.db.WithContext(ctx), ctx).Where("refresh_jti = ?", refreshJti).Delete(&sessionRow{}).Error
 		return "", false
 	}
 	return row.ID, true
@@ -87,11 +101,15 @@ func (s *databaseStore) ReplaceRefresh(ctx context.Context, oldRefreshJti, newAc
 		return "", false, errEmptySessionID
 	}
 	now := s.now()
+	tenantID := ""
+	if id, ok := tenancy.TenantIDFrom(ctx); ok {
+		tenantID = id.String()
+	}
 	var oldAccessJti string
 	var replaced bool
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var row sessionRow
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		if err := tenantScope(tx.Clauses(clause.Locking{Strength: "UPDATE"}), ctx).
 			Where("refresh_jti = ?", oldRefreshJti).First(&row).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return nil // replay or unknown: ok=false, no error
@@ -99,13 +117,13 @@ func (s *databaseStore) ReplaceRefresh(ctx context.Context, oldRefreshJti, newAc
 			return err
 		}
 		if !now.Before(row.RefreshExpiresAt) {
-			result := tx.Where("refresh_jti = ?", oldRefreshJti).Delete(&sessionRow{})
+			result := tenantScope(tx.Where("refresh_jti = ?", oldRefreshJti), ctx).Delete(&sessionRow{})
 			if result.Error != nil {
 				return result.Error
 			}
 			return nil // expired: reaped, replay either way
 		}
-		result := tx.Where("refresh_jti = ?", oldRefreshJti).Delete(&sessionRow{})
+		result := tenantScope(tx.Where("refresh_jti = ?", oldRefreshJti), ctx).Delete(&sessionRow{})
 		if result.Error != nil {
 			return result.Error
 		}
@@ -114,6 +132,7 @@ func (s *databaseStore) ReplaceRefresh(ctx context.Context, oldRefreshJti, newAc
 		}
 		next := sessionRow{
 			ID:               newAccessJti,
+			TenantID:         tenantID,
 			RefreshJTI:       newRefreshJti,
 			UserID:           userID,
 			AccessExpiresAt:  now.Add(accessTTL),
@@ -142,7 +161,7 @@ func (s *databaseStore) ConsumeRefresh(ctx context.Context, refreshJti string) (
 	var consumed bool
 	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var row sessionRow
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+		if err := tenantScope(tx.Clauses(clause.Locking{Strength: "UPDATE"}), ctx).
 			Where("refresh_jti = ?", refreshJti).First(&row).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return nil // replay or unknown: ok=false, no error
@@ -150,7 +169,7 @@ func (s *databaseStore) ConsumeRefresh(ctx context.Context, refreshJti string) (
 			return err
 		}
 		if !s.now().Before(row.RefreshExpiresAt) {
-			result := tx.Where("refresh_jti = ?", refreshJti).Delete(&sessionRow{})
+			result := tenantScope(tx.Where("refresh_jti = ?", refreshJti), ctx).Delete(&sessionRow{})
 			if result.Error != nil {
 				return result.Error
 			}
@@ -159,7 +178,7 @@ func (s *databaseStore) ConsumeRefresh(ctx context.Context, refreshJti string) (
 			}
 			return nil
 		}
-		result := tx.Where("refresh_jti = ?", refreshJti).Delete(&sessionRow{})
+		result := tenantScope(tx.Where("refresh_jti = ?", refreshJti), ctx).Delete(&sessionRow{})
 		if result.Error != nil {
 			return result.Error
 		}
@@ -177,7 +196,16 @@ func (s *databaseStore) ConsumeRefresh(ctx context.Context, refreshJti string) (
 }
 
 func (s *databaseStore) Unlink(ctx context.Context, accessJti, refreshJti string) error {
-	return s.db.WithContext(ctx).
+	return tenantScope(s.db.WithContext(ctx), ctx).
 		Where("id = ? OR refresh_jti = ?", accessJti, refreshJti).
+		Delete(&sessionRow{}).Error
+}
+
+func (s *databaseStore) RevokeUser(ctx context.Context, userID string) error {
+	if userID == "" {
+		return nil
+	}
+	return tenantScope(s.db.WithContext(ctx), ctx).
+		Where("user_id = ?", userID).
 		Delete(&sessionRow{}).Error
 }

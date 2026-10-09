@@ -126,6 +126,38 @@ func conformance(t *testing.T, name string, open func(t *testing.T) Store) {
 			t.Fatal("replay replaced twice")
 		}
 	})
+
+	t.Run(name+"/revoke-user", func(t *testing.T) {
+		s := open(t)
+		a1, r1 := uuid.NewString(), uuid.NewString()
+		a2, r2 := uuid.NewString(), uuid.NewString()
+		a3, r3 := uuid.NewString(), uuid.NewString()
+		user, other := uuid.NewString(), uuid.NewString()
+		if err := s.Link(ctx, a1, r1, user, time.Minute, time.Hour); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Link(ctx, a2, r2, user, time.Minute, time.Hour); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Link(ctx, a3, r3, other, time.Minute, time.Hour); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.RevokeUser(ctx, user); err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := s.AccessValid(ctx, a1); ok {
+			t.Fatal("revoked access half survived")
+		}
+		if _, ok := s.RefreshValid(ctx, r2); ok {
+			t.Fatal("revoked refresh half survived")
+		}
+		if _, ok := s.AccessValid(ctx, a3); !ok {
+			t.Fatal("other user's session revoked")
+		}
+		if err := s.RevokeUser(ctx, uuid.NewString()); err != nil {
+			t.Fatalf("unknown user: %v", err)
+		}
+	})
 }
 
 // TestSession is the single entry point for every session test: redis and
@@ -286,6 +318,7 @@ func TestSession(t *testing.T) {
 		// pgsql has no inline INDEX: same table, indexes as extra statements.
 		create := `CREATE TABLE sessions (
 			id CHAR(36) PRIMARY KEY,
+			tenant_id CHAR(36) NOT NULL DEFAULT '',
 			user_id CHAR(36) NULL,
 			refresh_jti CHAR(36) NOT NULL,
 			access_expires_at TIMESTAMP NULL DEFAULT NULL,
@@ -299,6 +332,7 @@ func TestSession(t *testing.T) {
 			// (CHAR pads on read and breaks JTI comparisons).
 			create = `CREATE TABLE sessions (
 				id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+				tenant_id CHAR(36) NOT NULL DEFAULT '',
 				user_id UUID NULL,
 				refresh_jti UUID NOT NULL,
 				access_expires_at TIMESTAMPTZ,

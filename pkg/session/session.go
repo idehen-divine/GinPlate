@@ -39,6 +39,9 @@ type Store interface {
 	ReplaceRefresh(ctx context.Context, oldRefreshJti, newAccessJti, newRefreshJti, userID string, accessTTL, refreshTTL time.Duration) (oldAccessJti string, ok bool, err error)
 	// Unlink destroys both halves. Missing halves are not errors.
 	Unlink(ctx context.Context, accessJti, refreshJti string) error
+	// RevokeUser destroys every session half owned by userID (password-reset
+	// revocation). Unknown users are not errors.
+	RevokeUser(ctx context.Context, userID string) error
 }
 
 // Open selects the session driver (unknown drivers fail fast; redis without
