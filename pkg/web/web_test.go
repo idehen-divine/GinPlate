@@ -1,90 +1,19 @@
 package web
 
 import (
-	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
-	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/golang-jwt/jwt/v5"
-	"github.com/google/uuid"
 	"gorm.io/gorm"
 )
-
-// stubSessionStore is a hermetic session.Store for middleware tests.
-type stubSessionStore struct {
-	mu       sync.Mutex
-	sessions map[string]string // accessJti -> refreshJti
-	refresh  map[string]string // refreshJti -> accessJti
-}
-
-func newStubSessionStore() *stubSessionStore {
-	return &stubSessionStore{sessions: map[string]string{}, refresh: map[string]string{}}
-}
-
-func (s *stubSessionStore) Link(_ context.Context, accessJti, refreshJti, _ string, _, _ time.Duration) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.sessions[accessJti] = refreshJti
-	s.refresh[refreshJti] = accessJti
-	return nil
-}
-
-func (s *stubSessionStore) AccessValid(_ context.Context, accessJti string) (string, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	rjti, ok := s.sessions[accessJti]
-	return rjti, ok
-}
-
-func (s *stubSessionStore) RefreshValid(_ context.Context, refreshJti string) (string, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	ajti, ok := s.refresh[refreshJti]
-	return ajti, ok
-}
-
-func (s *stubSessionStore) ConsumeRefresh(_ context.Context, refreshJti string) (string, bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	ajti, ok := s.refresh[refreshJti]
-	if !ok {
-		return "", false, nil
-	}
-	delete(s.refresh, refreshJti)
-	delete(s.sessions, ajti)
-	return ajti, true, nil
-}
-
-func (s *stubSessionStore) Unlink(_ context.Context, accessJti, refreshJti string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.sessions, accessJti)
-	delete(s.refresh, refreshJti)
-	return nil
-}
-
-func (s *stubSessionStore) ReplaceRefresh(_ context.Context, oldRefreshJti, newAccessJti, newRefreshJti, _ string, _, _ time.Duration) (string, bool, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	ajti, ok := s.refresh[oldRefreshJti]
-	if !ok {
-		return "", false, nil
-	}
-	delete(s.refresh, oldRefreshJti)
-	delete(s.sessions, ajti)
-	s.sessions[newAccessJti] = newRefreshJti
-	s.refresh[newRefreshJti] = newAccessJti
-	return ajti, true, nil
-}
 
 func testCtx(t *testing.T, method, target string) (*gin.Context, *httptest.ResponseRecorder) {
 	t.Helper()
@@ -110,13 +39,19 @@ type errTestType string
 
 func (e errTestType) Error() string { return string(e) }
 
+// errTestMapped is a custom domain error for mapper-registry tests.
+type errTestMapped string
+
+func (e errTestMapped) Error() string { return string(e) }
+
 // wrapTestErr wraps a record-miss the way repository code does.
 func wrapTestErr() error {
 	return fmt.Errorf("users: %w", gorm.ErrRecordNotFound)
 }
 
 // TestWeb is the single entry point for every web test: paging filters,
-// error envelopes, recovery, render mapping, auth guards, and maintenance.
+// error envelopes, recovery, render mapping, and maintenance. Auth guard
+// tests live in internal/middleware (auth_test.go).
 func TestWeb(t *testing.T) {
 	t.Run("paging/defaults", func(t *testing.T) {
 		gin.SetMode(gin.TestMode)
@@ -272,99 +207,51 @@ func TestWeb(t *testing.T) {
 		}
 	})
 
-	t.Run("auth/require-role", func(t *testing.T) {
-		run := func(role Role) *httptest.ResponseRecorder {
-			c, w := testCtx(t, "GET", "/users")
-			if role != "" {
-				c.Set("claims", &Claims{UserID: uuid.New(), Role: role})
+	t.Run("render/custom-mapper-first", func(t *testing.T) {
+		RegisterErrorMapper("test-mapping", func(err error) (*AppError, bool) {
+			var target errTestMapped
+			if !errors.As(err, &target) {
+				return nil, false
 			}
-			RequireRole("admin")(c)
-			return w
+			ae := New(http.StatusPaymentRequired, "Pay up.")
+			ae.Err = errors.New(string(target))
+			return ae, true
+		})
+		// Wrapped errors resolve through errors.As.
+		c, w := testCtx(t, "GET", "/x")
+		Render(c, fmt.Errorf("charge: %w", errTestMapped("card declined")))
+		body := bodyMap(t, w)
+		if w.Code != http.StatusPaymentRequired || body["message"] != "Pay up." {
+			t.Fatalf("got %d %v", w.Code, body)
 		}
-		if w := run(""); w.Code != http.StatusUnauthorized {
-			t.Fatalf("no claims = %d, want 401", w.Code)
-		}
-		if w := run("member"); w.Code != http.StatusForbidden {
-			t.Fatalf("member = %d, want 403", w.Code)
-		}
-		if w := run("admin"); w.Code != http.StatusOK {
-			t.Fatalf("admin = %d, want 200", w.Code)
+		// Mapped causes stay debug-gated like any 5xx detail: unmatched
+		// errors still fall through to the built-in 500.
+		c, w = testCtx(t, "GET", "/x")
+		Render(c, errTestBoom)
+		if w.Code != http.StatusInternalServerError {
+			t.Fatalf("fallback = %d, want 500", w.Code)
 		}
 	})
 
-	t.Run("auth/stale-version-rejected", func(t *testing.T) {
-		key := []byte("0123456789abcdef0123456789abcdef")
-		tok := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-			"sub": uuid.NewString(), "ver": "v0", "type": "access",
-			"iat": time.Now().Unix(), "exp": time.Now().Add(time.Hour).Unix(),
+	t.Run("render/mapper-dup-replaces", func(t *testing.T) {
+		// Uses errTestType so the earlier "test-mapping" mapper (which
+		// matches errTestMapped) cannot shadow this assertion: registry
+		// order is global and first-match-wins.
+		RegisterErrorMapper("test-replace", func(err error) (*AppError, bool) {
+			return nil, false
 		})
-		signed, err := tok.SignedString(key)
-		if err != nil {
-			t.Fatal(err)
-		}
-		c, w := testCtx(t, "GET", "/users")
-		c.Request.Header.Set("Authorization", "Bearer "+signed)
-		RequireAuth(key, nil)(c)
-		if w.Code != http.StatusUnauthorized {
-			t.Fatalf("stale version = %d, want 401", w.Code)
-		}
-	})
-
-	t.Run("auth/refresh-rejected-as-access", func(t *testing.T) {
-		key := []byte("0123456789abcdef0123456789abcdef")
-		tok := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-			"sub": uuid.NewString(), "jti": uuid.NewString(), "ver": TokenVersion, "type": "refresh",
-			"iat": time.Now().Unix(), "exp": time.Now().Add(24 * time.Hour).Unix(),
+		RegisterErrorMapper("test-replace", func(err error) (*AppError, bool) {
+			var target errTestType
+			if !errors.As(err, &target) {
+				return nil, false
+			}
+			return New(http.StatusTeapot, "Teapot."), true
 		})
-		signed, err := tok.SignedString(key)
-		if err != nil {
-			t.Fatal(err)
-		}
-		c, w := testCtx(t, "GET", "/users")
-		c.Request.Header.Set("Authorization", "Bearer "+signed)
-		RequireAuth(key, nil)(c)
-		if w.Code != http.StatusUnauthorized {
-			t.Fatalf("refresh as access = %d, want 401", w.Code)
-		}
-	})
-
-	t.Run("auth/wrong-alg-rejected", func(t *testing.T) {
-		key := []byte("0123456789abcdef0123456789abcdef")
-		tok := jwt.NewWithClaims(jwt.SigningMethodNone, jwt.MapClaims{
-			"sub": uuid.NewString(), "jti": uuid.NewString(), "ver": TokenVersion, "type": "access",
-			"iat": time.Now().Unix(), "exp": time.Now().Add(time.Hour).Unix(),
-		})
-		signed, err := tok.SignedString(jwt.UnsafeAllowNoneSignatureType)
-		if err != nil {
-			t.Fatal(err)
-		}
-		c, w := testCtx(t, "GET", "/users")
-		c.Request.Header.Set("Authorization", "Bearer "+signed)
-		RequireAuth(key, nil)(c)
-		if w.Code != http.StatusUnauthorized {
-			t.Fatalf("none alg = %d, want 401", w.Code)
-		}
-	})
-
-	t.Run("auth/revoked-rejected", func(t *testing.T) {
-		key := []byte("0123456789abcdef0123456789abcdef")
-		store := newStubSessionStore()
-		uid := uuid.NewString()
-		accessJTI := uuid.NewString()
-		tok := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-			"sub": uid, "jti": accessJTI, "ver": TokenVersion, "type": "access",
-			"iat": time.Now().Unix(), "exp": time.Now().Add(time.Hour).Unix(),
-		})
-		signed, err := tok.SignedString(key)
-		if err != nil {
-			t.Fatal(err)
-		}
-		// No session linked: revoked/unknown must fail closed.
-		c, w := testCtx(t, "GET", "/users")
-		c.Request.Header.Set("Authorization", "Bearer "+signed)
-		RequireAuth(key, store)(c)
-		if w.Code != http.StatusUnauthorized {
-			t.Fatalf("revoked = %d, want 401", w.Code)
+		c, w := testCtx(t, "GET", "/x")
+		Render(c, errTestBoom)
+		body := bodyMap(t, w)
+		if w.Code != http.StatusTeapot || body["message"] != "Teapot." {
+			t.Fatalf("second registration must win: got %d %v", w.Code, body)
 		}
 	})
 
@@ -405,9 +292,11 @@ func TestWeb(t *testing.T) {
 		if err := WriteDownFile(path, DownState{Secret: "s3cr3t"}); err != nil {
 			t.Fatal(err)
 		}
+		// Query-string secrets are rejected: bypass travels in the header
+		// only, since query strings leak into logs and history.
 		w = newReq("/api/v1/me?secret=s3cr3t", "")
-		if w.Code != 200 {
-			t.Fatalf("expected bypass via query, got %d", w.Code)
+		if w.Code != http.StatusServiceUnavailable {
+			t.Fatalf("query secret must not bypass: got %d", w.Code)
 		}
 		w = newReq("/api/v1/me", "s3cr3t")
 		if w.Code != 200 {

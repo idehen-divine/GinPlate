@@ -8,10 +8,8 @@ import (
 	"gorm.io/gorm"
 )
 
-// AppError is a classified domain error: the single type every handler
-// funnels through Render. Status and Message are always safe for clients;
-// Fields carries user-actionable detail (e.g. per-field validation);
-// Err is the internal cause, exposed only under the debug rule.
+// AppError is a classified domain error: the single type handlers funnel
+// through Render. Status/Message are client-safe; Err stays debug-gated.
 type AppError struct {
 	Status  int
 	Message string
@@ -65,21 +63,61 @@ func BadRequest(message string) *AppError {
 	return &AppError{Status: http.StatusBadRequest, Message: message}
 }
 
-// Internal classifies an unexpected failure (500) carrying its cause for
-// server-side logs. Clients see "Server Error", plus detail in debug mode.
+// Internal classifies an unexpected failure (500). Clients see "Server Error".
 func Internal(err error) *AppError {
 	return &AppError{Status: http.StatusInternalServerError, Message: "Server Error", Err: err}
 }
 
-// Render writes any error as an API error response and is a no-op on nil,
-// so handlers end with `return web.Render(c, err)` patterns. Mapping:
-//   - gorm.ErrRecordNotFound (any wrapping) -> 404 "Not found."
-//   - *AppError -> its status/message; Fields always shown, Err detail only
-//     under the debug rule enforced by Fail.
-//   - anything else -> 500 "Server Error", detail debug-gated by Fail.
+// ErrorMapper maps a custom error type to a response: (*AppError, true) to
+// handle, (nil, false) to pass. First match wins, in registration order.
+type ErrorMapper func(err error) (*AppError, bool)
+
+var (
+	errorMapperNames []string
+	errorMappers     = map[string]ErrorMapper{}
+)
+
+// RegisterErrorMapper registers a custom mapping under name (later calls
+// replace). Register from an init() in internal/exceptions.
+func RegisterErrorMapper(name string, fn ErrorMapper) {
+	if _, ok := errorMappers[name]; !ok {
+		errorMapperNames = append(errorMapperNames, name)
+	}
+	errorMappers[name] = fn
+}
+
+// registeredErrorMappers returns mappers in registration order.
+func registeredErrorMappers() []ErrorMapper {
+	out := make([]ErrorMapper, 0, len(errorMapperNames))
+	for _, n := range errorMapperNames {
+		if fn, ok := errorMappers[n]; ok && fn != nil {
+			out = append(out, fn)
+		}
+	}
+	return out
+}
+
+// Render writes any error as an API error response (no-op on nil). Order:
+// custom mappers, gorm not-found -> 404, *AppError -> its status, else 500.
 func Render(c *gin.Context, err error) {
 	if err == nil {
 		return
+	}
+	for _, fn := range registeredErrorMappers() {
+		if ae, ok := fn(err); ok && ae != nil {
+			status := ae.Status
+			if status == 0 {
+				status = http.StatusInternalServerError
+			}
+			var detail interface{}
+			if ae.Fields != nil {
+				detail = ae.Fields
+			} else if ae.Err != nil {
+				detail = ae.Err.Error()
+			}
+			Fail(c, status, ae.Message, detail)
+			return
+		}
 	}
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		Fail(c, http.StatusNotFound, "Not found.", nil)
