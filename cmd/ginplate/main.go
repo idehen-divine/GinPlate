@@ -4,6 +4,7 @@
 //	ginplate queue:work          # run the background worker
 //	ginplate schedule:work      # push due schedule entries to the queue
 //	ginplate queue:failed       # list buried jobs (retry/forget/flush too)
+//	ginplate route:list         # list all registered routes
 //	ginplate migrate up         # create the database (if missing) + run the schema
 //	ginplate migrate status     # show applied/pending migrations
 //	ginplate make:command Foo   # scaffold a clonable command (auto-registered)
@@ -26,24 +27,19 @@ import (
 	"github.com/idehen-divine/GinPlate/pkg/config"
 )
 
-// main loads config and runs the ginplate command tree. Commands that touch
-// services (serve, migrate) fail fast on bad config; generators, key
-// tooling, and help run config-free so bootstrapping (e.g. key:generate
-// before APP_KEY exists) always works.
+// main loads config (required only for service commands) and runs the tree.
 func main() {
-	cfg, err := config.Load()
+	config, err := config.Load()
 	if err != nil && needsConfig(os.Args[1:]) {
 		log.Fatalf("config: %v", err)
 	}
-	if err := commands.NewRoot(cfg).Execute(); err != nil {
+	if err := commands.NewRoot(config).Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 }
 
-// needsConfig reports whether the requested command touches services.
-// Help flags always win: `ginplate migrate --help` must print help even
-// when config is broken (checked first, before the command match).
+// needsConfig reports whether the command touches services (help flags exempt).
 func needsConfig(args []string) bool {
 	if len(args) == 0 {
 		return false

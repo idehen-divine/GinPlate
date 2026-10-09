@@ -1,4 +1,4 @@
-.PHONY: help commands run run-dev worker scheduler queue-failed queue-retry queue-forget queue-flush keygen mail-test down up migrate-up migrate-status migrate-rollback migrate-reset migrate-refresh migrate-fresh make-migration make-command make-job make-mail make-notification sync-commands docs swagger test test-race test-coverage fmt vet lint vuln verify check tidy build build-prod docker-build docker-up docker-down docker-logs install deps
+.PHONY: help commands run run-dev worker scheduler queue-failed queue-retry queue-forget queue-flush keygen mail-test down up migrate-up migrate-status migrate-rollback migrate-reset migrate-refresh migrate-fresh make-migration make-command make-job make-mail make-middleware make-exception make-notification sync-commands docs swagger test test-race test-coverage fmt vet lint vuln verify check tidy build build-prod docker-build docker-up docker-down docker-logs install deps
 
 help:
 	@echo "Available targets:"
@@ -18,8 +18,10 @@ help:
 	@echo "  migrate-fresh   - Drop every table, migrate from scratch (DESTRUCTIVE)"
 	@echo "  make-migration  - Scaffold a migration: NAME=CreatePostsTable [CREATE=posts]"
 	@echo "  make-command    - Scaffold a command: NAME=SendReport"
+	@echo "  make-exception  - Scaffold a domain error: NAME=PaymentRequired [STATUS=402]"
 	@echo "  make-job        - Scaffold a job: NAME=Billing.Charge [SCHEDULE=daily@02:00]"
 	@echo "  make-mail       - Scaffold a mailable: NAME=OrderShipped"
+	@echo "  make-middleware - Scaffold a middleware: NAME=AuditLog [GLOBAL=1]"
 	@echo "  make-notification - Scaffold a notification: NAME=OrderShipped"
 	@echo "  keygen          - Generate APP_KEY into .env"
 	@echo "  mail-test       - Send a test email: TO=a@b.c [SUBJECT=..] [QUEUE=1]"
@@ -99,6 +101,12 @@ make-job:
 
 make-mail:
 	go run ./cmd/ginplate make:mail $(NAME)
+
+make-middleware:
+	go run ./cmd/ginplate make:middleware $(NAME) $(if $(GLOBAL),--global)
+
+make-exception:
+	go run ./cmd/ginplate make:exception $(NAME) $(if $(STATUS),--status=$(STATUS))
 
 make-notification:
 	go run ./cmd/ginplate make:notification $(NAME)
