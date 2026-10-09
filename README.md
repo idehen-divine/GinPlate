@@ -302,6 +302,25 @@ ginplate queue:retry all
 Jobs retry according to `QUEUE_TRIES`. Exhausted jobs are buried into
 `failed_jobs` when a database connection is available.
 
+## Multi-tenancy
+
+Every tenant API call must identify its tenant: `X-Tenant-Slug` for slug
+clients, or `X-Tenant-Domain` for frontends on a verified custom domain
+(e.g. `app.acmecorp.com`) that never see the slug. Missing identification
+is a 400 — there is no fallback tenant. Tenants share the database by
+default with row-level isolation; enterprise tenants move to dedicated
+databases. See [TENANCY.md](TENANCY.md).
+
+```bash
+make migrate-up
+make seed-admin NAME=Root EMAIL=root@example.com PASSWORD=...
+make tenant-migrate SLUG=acme
+```
+
+See [TENANCY.md](TENANCY.md) for the migration layout (shared `app/`
+vs tenant-data `tenants/` domains), pool/provision commands, and wiring
+status.
+
 ## Scheduler
 
 Scheduled jobs are registered from Go code:

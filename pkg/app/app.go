@@ -19,6 +19,7 @@ import (
 	"gorm.io/gorm"
 	gormlogger "gorm.io/gorm/logger"
 
+	"github.com/idehen-divine/GinPlate/internal/modules/cadmin"
 	configPkg "github.com/idehen-divine/GinPlate/pkg/config"
 	"github.com/idehen-divine/GinPlate/pkg/database"
 	"github.com/idehen-divine/GinPlate/pkg/logger"
@@ -27,6 +28,7 @@ import (
 	"github.com/idehen-divine/GinPlate/pkg/queue"
 	redisPkg "github.com/idehen-divine/GinPlate/pkg/redis"
 	"github.com/idehen-divine/GinPlate/pkg/session"
+	"github.com/idehen-divine/GinPlate/pkg/tenancy"
 	"github.com/idehen-divine/GinPlate/pkg/web"
 	"github.com/idehen-divine/GinPlate/pkg/web/httpmw"
 
@@ -170,6 +172,33 @@ func RunAPI(config *configPkg.Config) error {
 		return fmt.Errorf("session store: %w", err)
 	}
 
+	// Elastic tenancy: the control database owns tenant records; tenant
+	// data resolves per request to shared pools or dedicated databases.
+	// Empty CONTROL_DSN/SHARED_POOL_DSNS reuse the primary database, so
+	// single-database development needs no extra configuration.
+	mgr, err := tenancy.NewDBManager(tenancy.ManagerParams{
+		Driver:      config.Database.Driver,
+		ControlDSN:  config.Tenancy.ControlDSN,
+		Pools:       tenancy.ParsePoolDSNs(config.Tenancy.PoolDSNs),
+		DefaultPool: config.Tenancy.DefaultPool,
+		DSNTemplate: config.Tenancy.DSNTemplate,
+		AppUser:     config.Tenancy.AppUser,
+		AppPass:     config.Tenancy.AppPass,
+		Log:         appLog.GormLogger(GormLogLevel(config.Database.LogMode), 0),
+	}, config.Database.DSN())
+	if err != nil {
+		return fmt.Errorf("tenancy: %w", err)
+	}
+	defer func() { _ = mgr.Close() }()
+
+	controlKey, fallback, err := cadmin.ResolveSecret(config.Tenancy.ControlJWTSecret, config.Auth.JWT.Secret)
+	if err != nil {
+		return fmt.Errorf("control auth: %w", err)
+	}
+	if fallback {
+		appLog.Warn("CONTROL_JWT_SECRET unset: control tokens share APP_KEY (set it explicitly in production)")
+	}
+
 	if !config.App.Debug {
 		gin.SetMode(gin.ReleaseMode)
 	}
@@ -221,7 +250,24 @@ func RunAPI(config *configPkg.Config) error {
 		m.Fn(router, deps)
 	}
 	// Modules self-register via init(); see internal/modules/register.go.
-	RegisterAPIRoutes(router, deps)
+	// Tenancy resolution wraps the same module set on one /api/v1 group
+	// (router.go), plus the control-plane admin surface.
+	RegisterAPIRoutesWithTenancy(router, deps, &TenancyRouteDeps{
+		Manager:     mgr,
+		ControlKey:  controlKey,
+		Store:       store,
+		Sender:      sender,
+		Queue:       notifQueue,
+		Driver:      config.Database.Driver,
+		DefaultPool: config.Tenancy.DefaultPool,
+		ChunkSize:   config.Tenancy.ChunkSize,
+		RetainDays:  config.Tenancy.RetainDays,
+		AppUser:     config.Tenancy.AppUser,
+		AppPass:     config.Tenancy.AppPass,
+		AppName:     config.App.Name,
+		AppURL:      config.App.URL,
+		Logf:        appLog.Errorf,
+	})
 	RegisterInfraRoutes(router, databaseConnection, sqlDatabase, redisClient, config.Filesystem.PublicURL, config.Filesystem.PublicRoot, config.App.Swagger, config.App.Metrics)
 
 	srv := &http.Server{

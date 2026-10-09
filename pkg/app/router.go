@@ -19,7 +19,16 @@ import (
 	_ "github.com/idehen-divine/GinPlate/internal/mail"
 	_ "github.com/idehen-divine/GinPlate/internal/middleware"
 	_ "github.com/idehen-divine/GinPlate/internal/modules"
+	"github.com/idehen-divine/GinPlate/internal/modules/cadmin"
+	"github.com/idehen-divine/GinPlate/internal/modules/notifications"
+	"github.com/idehen-divine/GinPlate/internal/modules/tenantdomains"
+	"github.com/idehen-divine/GinPlate/internal/modules/tenantmigrations"
+	"github.com/idehen-divine/GinPlate/internal/modules/tenants"
+	pkgmail "github.com/idehen-divine/GinPlate/pkg/mail"
+	"github.com/idehen-divine/GinPlate/pkg/notify"
+	"github.com/idehen-divine/GinPlate/pkg/queue"
 	"github.com/idehen-divine/GinPlate/pkg/session"
+	"github.com/idehen-divine/GinPlate/pkg/tenancy"
 	"github.com/idehen-divine/GinPlate/pkg/web"
 )
 
@@ -35,6 +44,84 @@ func RegisterAPIRoutes(router *gin.Engine, d *web.ModuleDeps) {
 	v1 := router.Group("/api/v1")
 	for _, m := range web.RegisteredModules() {
 		m.Fn(v1, d)
+	}
+}
+
+// TenancyRouteDeps carries the live tenancy backends plus the settings the
+// control-plane admin surface is built from. Capture at registration, touch
+// only when serving (nil Manager mounts modules without tenancy, so
+// `route:list` stays config-free).
+type TenancyRouteDeps struct {
+	Manager     *tenancy.DBManager
+	ControlKey  []byte
+	Store       session.Store
+	Sender      pkgmail.Sender
+	Queue       queue.Queue
+	Driver      string
+	DefaultPool string
+	ChunkSize   int
+	RetainDays  int
+	AppUser     string
+	AppPass     string
+	AppName     string
+	AppURL      string
+	Logf        func(format string, args ...any)
+}
+
+// RegisterAPIRoutesWithTenancy mounts /api/v1 from every registered module
+// behind tenant resolution, plus the control-plane admin surface. It shares
+// RegisterAPIRoutes' module loop so serve and route:list never drift: serve
+// calls this, route:list calls RegisterAPIRoutes.
+func RegisterAPIRoutesWithTenancy(router *gin.Engine, d *web.ModuleDeps, td *TenancyRouteDeps) {
+	v1 := router.Group("/api/v1")
+	// Tenant routes resolve their database per request; the control-plane
+	// admin surface (skipped by ResolveTenant) pins the control handle.
+	if td != nil && td.Manager != nil {
+		v1.Use(tenancy.FinalizeTx(), tenancy.ResolveTenant(td.Manager), tenancy.BlockWritesWhenMigrating())
+	}
+	for _, m := range web.RegisteredModules() {
+		m.Fn(v1, d)
+	}
+	mountAdminRoutes(v1, td)
+}
+
+// mountAdminRoutes pins the control-plane admin surface: control auth stays
+// open, tenant/domain/move routes sit behind control-admin auth with the
+// control database on every request. Explicit repositories are constructed
+// here so misconfiguration surfaces at boot, not at first request. Nil-safe:
+// a nil Manager (listing) mounts nothing.
+func mountAdminRoutes(v1 *gin.RouterGroup, td *TenancyRouteDeps) {
+	if td == nil || td.Manager == nil || td.Manager.Control() == nil {
+		return
+	}
+	control := td.Manager.Control()
+	logf := td.Logf
+	if logf == nil {
+		logf = func(string, ...any) {}
+	}
+	// Control-plane admin surface resolves its own (control) handle.
+	admin := v1.Group("/admin")
+	admin.Use(web.ProvideDB(control))
+	{
+		cadminSvc := cadmin.NewService(td.ControlKey).WithStore(td.Store).WithMailer(td.Sender, td.AppURL, td.AppName)
+		controlNotifier := notify.NewNotifier(control, td.Sender)
+		cadmin.RegisterRoutes(admin, cadmin.NewHandler(cadminSvc), cadminSvc, control,
+			cadmin.Inbox(notifications.NewService(nil)))
+		secured := admin.Group("")
+		secured.Use(cadmin.RequireControlAdmin(cadminSvc, control))
+		tenantSvc := tenants.NewTenants(control, tenants.GormRepository{}, tenants.GormRepository{}, td.Manager, td.DefaultPool).WithNotifier(controlNotifier)
+		domainSvc := tenantdomains.NewTenantDomain(control, tenants.GormRepository{}, tenantSvc)
+		migrator := tenantmigrations.NewTenantMigrations(td.Manager, control, tenants.GormRepository{}, tenants.GormRepository{}, tenantmigrations.TenantMigrationsOpts{
+			Driver:     td.Driver,
+			ChunkSize:  td.ChunkSize,
+			RetainDays: td.RetainDays,
+			AppUser:    td.AppUser,
+			AppPass:    td.AppPass,
+			Logf:       logf,
+		}).WithQueue(td.Queue).WithNotifier(controlNotifier)
+		tenants.RegisterRoutes(secured, tenants.NewHandler(tenantSvc))
+		tenantdomains.RegisterRoutes(secured, tenantdomains.NewHandler(domainSvc))
+		tenantmigrations.RegisterRoutes(secured, tenantmigrations.NewHandler(migrator))
 	}
 }
 

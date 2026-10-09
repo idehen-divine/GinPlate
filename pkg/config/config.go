@@ -45,6 +45,7 @@ type Config struct {
 	Session     Session     `mapstructure:",squash"`
 	Services    Services    `mapstructure:",squash"`
 	Maintenance Maintenance `mapstructure:",squash"`
+	Tenancy     Tenancy     `mapstructure:",squash"`
 }
 
 // bindEnvKeys registers every mapstructure key so Unmarshal sees env vars
@@ -123,6 +124,7 @@ func Load() (*Config, error) {
 	applyQueueDefaults(v)
 	applyLoggingDefaults(v)
 	applySessionDefaults(v)
+	applyTenancyDefaults(v)
 
 	bindEnvKeys(v, reflect.TypeOf(Config{}))
 
@@ -173,6 +175,13 @@ func (c *Config) Validate() error {
 	// CA/server name must fail startup, never silently downgrade.
 	if err := c.Database.ValidateTLS(); err != nil {
 		return err
+	}
+	// Dedicated DSN templates build per-tenant DSNs with one %s for the
+	// slug: a template without it would route every dedicated tenant to
+	// the same database. Fails in every environment so the error surfaces
+	// at boot, not at first move.
+	if tpl := strings.TrimSpace(c.Tenancy.DSNTemplate); tpl != "" && !strings.Contains(tpl, "%s") {
+		return fmt.Errorf("config: TENANT_DSN_TEMPLATE must contain one %%s for the tenant slug")
 	}
 	// The public disk subtree is served over HTTP: sessions, the maintenance
 	// marker, and logs must never live under it, or they become downloadable.
@@ -247,6 +256,17 @@ func (c *Config) Validate() error {
 	}
 	if (c.App.HTTP.TLSCertFile == "") != (c.App.HTTP.TLSKeyFile == "") {
 		fail("TLS_CERT_FILE and TLS_KEY_FILE must both be set for direct HTTPS")
+	}
+	// Control-plane token separation: without an explicit secret, control
+	// tokens share APP_KEY with tenant tokens (startup warns); hardened
+	// environments require the split.
+	if strings.TrimSpace(c.Tenancy.ControlJWTSecret) == "" {
+		fail("CONTROL_JWT_SECRET must be explicit in a hardened environment (control-plane/admin token separation)")
+	}
+	// A split control database with no pools sends new tenants into the
+	// control database: pools must be listed explicitly.
+	if strings.TrimSpace(c.Tenancy.ControlDSN) != "" && strings.TrimSpace(c.Tenancy.PoolDSNs) == "" {
+		fail("SHARED_POOL_DSNS must list pools in a hardened environment when CONTROL_DSN splits the control database (else tenants land in control)")
 	}
 	if len(errs) > 0 {
 		return fmt.Errorf("config: unsafe %s configuration:\n - %s", c.App.Env, strings.Join(errs, "\n - "))

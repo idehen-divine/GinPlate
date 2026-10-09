@@ -143,6 +143,7 @@ func TestConfig(t *testing.T) {
 			c.App.HTTP.ShutdownTimeoutSec = 5
 			c.App.HTTP.CORSAllowedOrigins = "https://app.example.com"
 			c.Mail.Mailer = "smtp"
+			c.Tenancy.ControlJWTSecret = "test-control-secret-at-least-32-chars!"
 			c.Session.Driver = "redis"
 			c.Database.Redis.Host = "redis"
 			c.Database.Host = "db"
@@ -216,6 +217,7 @@ func TestConfig(t *testing.T) {
 		c.Database.ConnMaxLifetime = 1800
 		c.Database.ConnMaxIdleTime = 300
 		c.Mail.Mailer = "smtp"
+		c.Tenancy.ControlJWTSecret = "test-control-secret-at-least-32-chars!"
 		c.Session.Driver = "redis"
 		c.Database.Redis.Host = "redis"
 		if err := c.Validate(); err != nil {

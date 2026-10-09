@@ -1,4 +1,4 @@
-.PHONY: help commands run run-dev worker scheduler queue-failed queue-retry queue-forget queue-flush keygen mail-test down up migrate-up migrate-status migrate-rollback migrate-reset migrate-refresh migrate-fresh make-migration make-command make-job make-mail make-middleware make-exception make-notification sync-commands docs swagger test test-race test-coverage fmt vet lint vuln verify check tidy build build-prod docker-build docker-up docker-down docker-logs install deps
+.PHONY: help commands run run-dev worker scheduler queue-failed queue-retry queue-forget queue-flush keygen mail-test down up migrate-up migrate-status migrate-rollback migrate-reset migrate-refresh migrate-fresh migrate-pool-up migrate-provision migrate-tenant seed-admin tenant-migrate tenant-cleanup tenant-status tenant-rollback make-migration make-command make-job make-mail make-middleware make-exception make-notification sync-commands docs swagger test test-race test-coverage fmt vet lint vuln verify check tidy build build-prod docker-build docker-up docker-down docker-logs install deps
 
 help:
 	@echo "Available targets:"
@@ -16,6 +16,14 @@ help:
 	@echo "  migrate-reset   - Revert all applied migrations"
 	@echo "  migrate-refresh - Revert all, then re-apply (dev/test only)"
 	@echo "  migrate-fresh   - Drop every table, migrate from scratch (DESTRUCTIVE)"
+	@echo "  migrate-pool-up - Run tenant-data migrations on a pool: [POOL=name]"
+	@echo "  migrate-provision - Create + migrate a dedicated DB: SLUG=<slug>"
+	@echo "  migrate-tenant  - Migrate one tenant's database: SLUG=<slug>"
+	@echo "  seed-admin      - Create a control super_admin: NAME=.. EMAIL=.. PASSWORD=.."
+	@echo "  tenant-migrate  - Move a tenant shared -> dedicated: SLUG=<slug> [REASON=..]"
+	@echo "  tenant-cleanup  - Drop retained pool rows: SLUG=<slug> [FORCE=1]"
+	@echo "  tenant-status   - Show newest migration ledger row: SLUG=<slug>"
+	@echo "  tenant-rollback - Roll back a move: ID=<migration-id>"
 	@echo "  make-migration  - Scaffold a migration: NAME=CreatePostsTable [CREATE=posts]"
 	@echo "  make-command    - Scaffold a command: NAME=SendReport"
 	@echo "  make-exception  - Scaffold a domain error: NAME=PaymentRequired [STATUS=402]"
@@ -89,6 +97,30 @@ migrate-refresh:
 
 migrate-fresh:
 	go run ./cmd/ginplate migrate fresh
+
+migrate-pool-up:
+	go run ./cmd/ginplate migrate pool up $(if $(POOL),--pool $(POOL))
+
+migrate-provision:
+	go run ./cmd/ginplate migrate provision $(SLUG)
+
+migrate-tenant:
+	go run ./cmd/ginplate migrate tenant $(SLUG)
+
+seed-admin:
+	go run ./cmd/ginplate migrate seed-admin $(NAME) $(EMAIL) $(PASSWORD)
+
+tenant-migrate:
+	go run ./cmd/ginplate migrate tenant-migrate $(SLUG) $(if $(REASON),--reason "$(REASON)")
+
+tenant-cleanup:
+	go run ./cmd/ginplate migrate tenant-cleanup $(SLUG) $(if $(FORCE),--force)
+
+tenant-status:
+	go run ./cmd/ginplate migrate tenant-status $(SLUG)
+
+tenant-rollback:
+	go run ./cmd/ginplate migrate tenant-rollback $(ID)
 
 make-migration:
 	go run ./cmd/ginplate make:migration $(NAME) $(if $(CREATE),--create $(CREATE))
