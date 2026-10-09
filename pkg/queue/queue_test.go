@@ -16,21 +16,21 @@ import (
 // errTestBoom is the canned handler failure for retry/bury cases.
 var errTestBoom = errors.New("boom")
 
-// fakeQueue is a scripted Queue: scripted jobs drain in order, then it
+// fakeJobQueue is a scripted Queue: scripted jobs drain in order, then it
 // reports empty. acked and failed record outcomes for assertions.
-type fakeQueue struct {
+type fakeJobQueue struct {
 	jobs   []Job
 	acked  []string
 	failed []string
 	buried []string
 }
 
-func (f *fakeQueue) Push(_ context.Context, name string, payload []byte) (string, error) {
+func (f *fakeJobQueue) Push(_ context.Context, name string, payload []byte) (string, error) {
 	f.jobs = append(f.jobs, Job{ID: "fake", Name: name, Payload: payload, Attempts: 1})
 	return "fake", nil
 }
 
-func (f *fakeQueue) Reserve(_ context.Context) (Job, bool, error) {
+func (f *fakeJobQueue) Reserve(_ context.Context) (Job, bool, error) {
 	if len(f.jobs) == 0 {
 		return Job{}, false, nil
 	}
@@ -39,43 +39,43 @@ func (f *fakeQueue) Reserve(_ context.Context) (Job, bool, error) {
 	return job, true, nil
 }
 
-func (f *fakeQueue) Ack(_ context.Context, id string) error {
+func (f *fakeJobQueue) Ack(_ context.Context, id string) error {
 	f.acked = append(f.acked, id)
 	return nil
 }
 
-func (f *fakeQueue) Fail(_ context.Context, job Job, _ error) error {
+func (f *fakeJobQueue) Fail(_ context.Context, job Job, _ error) error {
 	f.failed = append(f.failed, job.ID)
 	return nil
 }
 
 // buryQueue is a Queue that buries everything: Fail always reports burial,
 // driving the OnBuried path without a database.
-type buryQueue struct{ fakeQueue }
+type buryQueue struct{ fakeJobQueue }
 
 func (q *buryQueue) Fail(_ context.Context, job Job, _ error) error { return ErrJobBuried }
 
 // ackFailQueue fails every Ack to pin the ack-failure logging path.
-type ackFailQueue struct{ fakeQueue }
+type ackFailQueue struct{ fakeJobQueue }
 
 func (q *ackFailQueue) Ack(_ context.Context, _ string) error { return errTestBoom }
 
-// recordStore is a FailedStore keeping rows in memory.
-type recordStore struct{ rows []FailedJob }
+// recordingFailedStore is a FailedStore keeping rows in memory.
+type recordingFailedStore struct{ rows []FailedJob }
 
-func (s *recordStore) Record(_ context.Context, job FailedJob) error {
+func (s *recordingFailedStore) Record(_ context.Context, job FailedJob) error {
 	s.rows = append(s.rows, job)
 	return nil
 }
 
-func (s *recordStore) List(_ context.Context, limit int) ([]FailedJob, error) {
+func (s *recordingFailedStore) List(_ context.Context, limit int) ([]FailedJob, error) {
 	if limit > 0 && limit < len(s.rows) {
 		return append([]FailedJob(nil), s.rows[:limit]...), nil
 	}
 	return append([]FailedJob(nil), s.rows...), nil
 }
 
-func (s *recordStore) Get(_ context.Context, id string) (FailedJob, error) {
+func (s *recordingFailedStore) Get(_ context.Context, id string) (FailedJob, error) {
 	for _, row := range s.rows {
 		if row.ID == id || row.Name == id {
 			return row, nil
@@ -84,7 +84,7 @@ func (s *recordStore) Get(_ context.Context, id string) (FailedJob, error) {
 	return FailedJob{}, errors.New("failed job not found")
 }
 
-func (s *recordStore) Delete(_ context.Context, ids ...string) error {
+func (s *recordingFailedStore) Delete(_ context.Context, ids ...string) error {
 	keep := s.rows[:0]
 	for _, row := range s.rows {
 		drop := false
@@ -102,9 +102,28 @@ func (s *recordStore) Delete(_ context.Context, ids ...string) error {
 	return nil
 }
 
-func (s *recordStore) Flush(_ context.Context) error {
+func (s *recordingFailedStore) Flush(_ context.Context) error {
 	s.rows = nil
 	return nil
+}
+
+// reserveSoon polls Reserve until a job arrives or the deadline passes.
+// MySQL TIMESTAMP has second precision, so a push late in a second can
+// land fractionally in the future; workers poll in production, tests poll
+// here instead of assuming instant visibility.
+func reserveSoon(ctx context.Context, t *testing.T, q Queue) (Job, bool, error) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		job, ok, err := q.Reserve(ctx)
+		if err != nil || ok {
+			return job, ok, err
+		}
+		if time.Now().After(deadline) {
+			return job, false, nil
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
 
 // conformance exercises the Queue contract against any backend: push and
@@ -124,7 +143,7 @@ func conformance(t *testing.T, name string, open func(t *testing.T) Queue) {
 		if err != nil || id2 == "" || id2 == id1 {
 			t.Fatalf("push 2: %v %q", err, id2)
 		}
-		first, ok, err := q.Reserve(ctx)
+		first, ok, err := reserveSoon(ctx, t, q)
 		if err != nil || !ok || first.Name != "a" || first.Attempts != 1 {
 			t.Fatalf("first reserve = %+v,%v,%v", first, ok, err)
 		}
@@ -145,10 +164,12 @@ func conformance(t *testing.T, name string, open func(t *testing.T) Queue) {
 		if _, ok, err := q.Reserve(ctx); err != nil || ok {
 			t.Fatalf("empty reserve = %v,%v", ok, err)
 		}
-		if err := q.Ack(ctx, "missing"); err != nil {
+		// Nil UUID: valid shape on every backend (pgsql rejects malformed
+		// UUID literals), guaranteed absent so the miss paths trigger.
+		if err := q.Ack(ctx, "00000000-0000-0000-0000-000000000000"); err != nil {
 			t.Fatalf("ack missing: %v", err)
 		}
-		if err := q.Fail(ctx, Job{ID: "missing", Name: "x", Attempts: 99}, errTestBoom); err == nil {
+		if err := q.Fail(ctx, Job{ID: "00000000-0000-0000-0000-000000000000", Name: "x", Attempts: 99}, errTestBoom); err == nil {
 			t.Fatal("fail past tries should bury")
 		}
 	})
@@ -159,14 +180,14 @@ func conformance(t *testing.T, name string, open func(t *testing.T) Queue) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		job, ok, err := q.Reserve(ctx)
+		job, ok, err := reserveSoon(ctx, t, q)
 		if err != nil || !ok || job.ID != id {
 			t.Fatalf("reserve = %+v,%v,%v", job, ok, err)
 		}
 		if err := q.Fail(ctx, job, errTestBoom); err != nil {
 			t.Fatalf("first fail should requeue: %v", err)
 		}
-		again, ok, err := q.Reserve(ctx)
+		again, ok, err := reserveSoon(ctx, t, q)
 		if err != nil || !ok || again.ID != id || again.Attempts != job.Attempts+1 {
 			t.Fatalf("retry reserve = %+v,%v,%v", again, ok, err)
 		}
@@ -310,9 +331,9 @@ func TestQueue(t *testing.T) {
 			name VARCHAR(64) NOT NULL,
 			payload TEXT NOT NULL,
 			attempts INT NOT NULL DEFAULT 0,
-			available_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-			reserved_at TIMESTAMP NULL DEFAULT NULL,
-			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			available_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+			reserved_at TIMESTAMP(6) NULL DEFAULT NULL,
+			created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
 			INDEX idx_jobs_available (available_at)
 		)`
 		if driver == "pgsql" {
@@ -351,21 +372,21 @@ func TestQueue(t *testing.T) {
 		noop := func(format string, args ...interface{}) {}
 		reg := NewRegistry()
 
-		q := &fakeQueue{jobs: []Job{{ID: "u1", Name: "missing", Attempts: 1}}}
+		q := &fakeJobQueue{jobs: []Job{{ID: "u1", Name: "missing", Attempts: 1}}}
 		Dispatch(ctx, q, reg, Job{ID: "u1", Name: "missing", Attempts: 1}, noop)
 		if len(q.acked) != 1 || len(q.failed) != 0 {
 			t.Fatalf("unknown should ack, got acked=%v failed=%v", q.acked, q.failed)
 		}
 
 		reg.Handle("boom", func(_ context.Context, _ Job) error { return errors.New("bang") })
-		q = &fakeQueue{}
+		q = &fakeJobQueue{}
 		Dispatch(ctx, q, reg, Job{ID: "f1", Name: "boom", Attempts: 1}, noop)
 		if len(q.failed) != 1 || len(q.acked) != 0 {
 			t.Fatalf("failure should fail, got acked=%v failed=%v", q.acked, q.failed)
 		}
 
 		reg.Handle("ok", func(_ context.Context, _ Job) error { return nil })
-		q = &fakeQueue{}
+		q = &fakeJobQueue{}
 		Dispatch(ctx, q, reg, Job{ID: "s1", Name: "ok", Attempts: 1}, noop)
 		if len(q.acked) != 1 || len(q.failed) != 0 {
 			t.Fatalf("success should ack, got acked=%v failed=%v", q.acked, q.failed)
@@ -381,7 +402,7 @@ func TestQueue(t *testing.T) {
 			cancel()
 			return nil
 		})
-		q := &fakeQueue{jobs: []Job{{ID: "w1", Name: "once", Payload: []byte("hi"), Attempts: 1}}}
+		q := &fakeJobQueue{jobs: []Job{{ID: "w1", Name: "once", Payload: []byte("hi"), Attempts: 1}}}
 		noop := func(format string, args ...interface{}) {}
 		if err := Run(ctx, q, reg, noop); err != nil {
 			t.Fatal(err)
@@ -404,7 +425,7 @@ func TestQueue(t *testing.T) {
 		noop := func(format string, args ...interface{}) {}
 		reg := NewRegistry()
 		reg.Handle("flaky", func(_ context.Context, _ Job) error { return errTestBoom })
-		store := &recordStore{}
+		store := &recordingFailedStore{}
 		q := &buryQueue{}
 		DispatchBuried(ctx, q, reg, Job{ID: "b1", Name: "flaky", Payload: []byte(`{}`), Attempts: 3},
 			noop, []OnBuried{RecordHook(store, "sync", noop)})
@@ -420,7 +441,7 @@ func TestQueue(t *testing.T) {
 	t.Run("failed/unknown-name-records", func(t *testing.T) {
 		ctx := context.Background()
 		noop := func(format string, args ...interface{}) {}
-		store := &recordStore{}
+		store := &recordingFailedStore{}
 		DispatchBuried(ctx, &buryQueue{}, NewRegistry(), Job{ID: "u9", Name: "ghost", Attempts: 1},
 			noop, []OnBuried{RecordHook(store, "redis", noop)})
 		if len(store.rows) != 1 || !strings.Contains(store.rows[0].Exception, "ghost") {
@@ -430,7 +451,7 @@ func TestQueue(t *testing.T) {
 
 	t.Run("failed/retry-round-trip", func(t *testing.T) {
 		ctx := context.Background()
-		store := &recordStore{}
+		store := &recordingFailedStore{}
 		if err := store.Record(ctx, FailedJob{ID: "r1", Connection: "database", Name: "flaky", Payload: []byte(`{"n":1}`), Exception: "boom", Attempts: 3}); err != nil {
 			t.Fatal(err)
 		}
@@ -438,7 +459,7 @@ func TestQueue(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		q := &fakeQueue{}
+		q := &fakeJobQueue{}
 		if _, err := q.Push(ctx, row.Name, row.Payload); err != nil {
 			t.Fatal(err)
 		}
@@ -461,7 +482,7 @@ func TestQueue(t *testing.T) {
 		}
 		reg := NewRegistry()
 		reg.Handle("ok", func(_ context.Context, _ Job) error { return nil })
-		q := &ackFailQueue{fakeQueue: fakeQueue{jobs: []Job{{ID: "a1", Name: "ok", Attempts: 1}}}}
+		q := &ackFailQueue{fakeJobQueue: fakeJobQueue{jobs: []Job{{ID: "a1", Name: "ok", Attempts: 1}}}}
 		Dispatch(ctx, q, reg, Job{ID: "a1", Name: "ok", Attempts: 1}, logf)
 		found := false
 		for _, m := range logged {
@@ -477,7 +498,7 @@ func TestQueue(t *testing.T) {
 	t.Run("dispatch/unknown-name-buried", func(t *testing.T) {
 		ctx := context.Background()
 		noop := func(format string, args ...interface{}) {}
-		q := &fakeQueue{}
+		q := &fakeJobQueue{}
 		Dispatch(ctx, q, NewRegistry(), Job{ID: "u1", Name: "ghost", Attempts: 1}, noop)
 		if len(q.acked) != 1 {
 			t.Fatalf("unknown job not acked: %+v", q.acked)

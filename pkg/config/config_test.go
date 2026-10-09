@@ -145,6 +145,11 @@ func TestConfig(t *testing.T) {
 			c.Mail.Mailer = "smtp"
 			c.Session.Driver = "redis"
 			c.Database.Redis.Host = "redis"
+			c.Database.Host = "db"
+			c.Database.MaxOpenConns = 20
+			c.Database.MaxIdleConns = 5
+			c.Database.ConnMaxLifetime = 1800
+			c.Database.ConnMaxIdleTime = 300
 			return c
 		}
 		for _, mode := range []string{"require", "skip-verify", "true", "disable", ""} {
@@ -167,6 +172,29 @@ func TestConfig(t *testing.T) {
 		}
 	})
 
+	t.Run("validate-tls-registration-fails-closed", func(t *testing.T) {
+		// Verifying mode with an unreadable CA bundle must fail boot in any
+		// environment — never silently downgrade to skip-verify.
+		d := Database{Driver: "mysql", Host: "db", SSLMode: "verify-full", SSLRootCert: filepath.Join(t.TempDir(), "missing.pem")}
+		if err := d.ValidateTLS(); err == nil {
+			t.Fatal("expected TLS registration error for missing CA bundle")
+		}
+		// Non-verifying modes and non-mysql drivers skip registration.
+		d = Database{Driver: "mysql", Host: "db", SSLMode: "disable"}
+		if err := d.ValidateTLS(); err != nil {
+			t.Fatalf("disable must skip registration: %v", err)
+		}
+		d = Database{Driver: "pgsql", Host: "db", SSLMode: "verify-full"}
+		if err := d.ValidateTLS(); err != nil {
+			t.Fatalf("pgsql must skip mysql registration: %v", err)
+		}
+		// A valid verifying config registers without error.
+		d = Database{Driver: "mysql", Host: "db", SSLMode: "verify-ca"}
+		if err := d.ValidateTLS(); err != nil {
+			t.Fatalf("verify-ca rejected: %v", err)
+		}
+	})
+
 	t.Run("validate-rejects-unsafe-production", func(t *testing.T) {
 		c := &Config{}
 		c.App.Env = "production"
@@ -182,11 +210,65 @@ func TestConfig(t *testing.T) {
 		c.App.URL = "https://app.example.com"
 		c.App.HTTP.CORSAllowedOrigins = "https://app.example.com"
 		c.Database.SSLMode = "verify-full"
+		c.Database.Host = "db"
+		c.Database.MaxOpenConns = 20
+		c.Database.MaxIdleConns = 5
+		c.Database.ConnMaxLifetime = 1800
+		c.Database.ConnMaxIdleTime = 300
 		c.Mail.Mailer = "smtp"
 		c.Session.Driver = "redis"
 		c.Database.Redis.Host = "redis"
 		if err := c.Validate(); err != nil {
 			t.Fatalf("safe production config rejected: %v", err)
+		}
+	})
+
+	t.Run("public-root-separation", func(t *testing.T) {
+		c := &Config{}
+		c.Filesystem.PublicRoot = "storage/app/public"
+		c.App.Maintenance.Path = "storage/app/public/down"
+		if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "public disk root") {
+			t.Fatalf("marker under public root accepted: %v", err)
+		}
+		c.App.Maintenance.Path = "storage/framework/down"
+		c.Logging.Output = "storage/logs"
+		if err := c.Validate(); err != nil {
+			t.Fatalf("default layout rejected: %v", err)
+		}
+	})
+
+	t.Run("hardened-envs", func(t *testing.T) {
+		for env, want := range map[string]bool{
+			"production": true, "prod": true, "staging": true, "stage": true,
+			"STAGING": true, "local": false, "test": false, "dev": false, "": false,
+		} {
+			if got := IsHardenedEnv(env); got != want {
+				t.Errorf("IsHardenedEnv(%q) = %v, want %v", env, got, want)
+			}
+		}
+	})
+
+	t.Run("validate-rejects-unsafe-staging", func(t *testing.T) {
+		c := &Config{}
+		c.App.Env = "staging"
+		c.App.Debug = true
+		c.App.URL = "http://localhost:8080"
+		c.App.Port = "8080"
+		c.App.HTTP.ReadTimeoutSec = 15
+		c.App.HTTP.WriteTimeoutSec = 15
+		c.App.HTTP.IdleTimeoutSec = 60
+		c.App.HTTP.ShutdownTimeoutSec = 5
+		c.Database.MaxOpenConns = 20
+		c.Database.MaxIdleConns = 5
+		c.Database.ConnMaxLifetime = 1800
+		c.Database.ConnMaxIdleTime = 300
+		if err := c.Validate(); err == nil {
+			t.Fatal("expected staging validation to fail for debug + http URL")
+		}
+		// Local stays permissive with the same shape.
+		c.App.Env = "local"
+		if err := c.Validate(); err != nil {
+			t.Fatalf("local config rejected: %v", err)
 		}
 	})
 }

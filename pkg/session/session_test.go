@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/alicebob/miniredis/v2"
+	"github.com/google/uuid"
 	"github.com/idehen-divine/GinPlate/pkg/database"
 	"github.com/redis/go-redis/v9"
 )
@@ -19,100 +20,109 @@ func conformance(t *testing.T, name string, open func(t *testing.T) Store) {
 	t.Helper()
 	ctx := context.Background()
 
+	// JTIs are fresh UUIDs per subtest: the pgsql schema types them UUID,
+	// so short fakes like "r1" are rejected by the database itself.
 	t.Run(name+"/link-valid", func(t *testing.T) {
 		s := open(t)
-		if err := s.Link(ctx, "a1", "r1", "u1", time.Minute, time.Hour); err != nil {
+		access, refresh, user := uuid.NewString(), uuid.NewString(), uuid.NewString()
+		if err := s.Link(ctx, access, refresh, user, time.Minute, time.Hour); err != nil {
 			t.Fatal(err)
 		}
-		if rjti, ok := s.AccessValid(ctx, "a1"); !ok || rjti != "r1" {
+		if rjti, ok := s.AccessValid(ctx, access); !ok || rjti != refresh {
 			t.Fatalf("access = %q,%v", rjti, ok)
 		}
-		if ajti, ok := s.RefreshValid(ctx, "r1"); !ok || ajti != "a1" {
+		if ajti, ok := s.RefreshValid(ctx, refresh); !ok || ajti != access {
 			t.Fatalf("refresh = %q,%v", ajti, ok)
 		}
 	})
 
 	t.Run(name+"/miss", func(t *testing.T) {
 		s := open(t)
-		if _, ok := s.AccessValid(ctx, "nope"); ok {
+		missing := uuid.NewString()
+		if _, ok := s.AccessValid(ctx, missing); ok {
 			t.Fatal("missing access half should be invalid")
 		}
-		if _, ok := s.RefreshValid(ctx, "nope"); ok {
+		if _, ok := s.RefreshValid(ctx, missing); ok {
 			t.Fatal("missing refresh half should be invalid")
 		}
-		if err := s.Unlink(ctx, "nope", "nope"); err != nil {
+		if err := s.Unlink(ctx, missing, missing); err != nil {
 			t.Fatalf("unlink missing: %v", err)
 		}
 	})
 
 	t.Run(name+"/unlink", func(t *testing.T) {
 		s := open(t)
-		if err := s.Link(ctx, "a2", "r2", "u2", time.Minute, time.Hour); err != nil {
+		access, refresh, user := uuid.NewString(), uuid.NewString(), uuid.NewString()
+		if err := s.Link(ctx, access, refresh, user, time.Minute, time.Hour); err != nil {
 			t.Fatal(err)
 		}
-		if err := s.Unlink(ctx, "a2", "r2"); err != nil {
+		if err := s.Unlink(ctx, access, refresh); err != nil {
 			t.Fatal(err)
 		}
-		if _, ok := s.AccessValid(ctx, "a2"); ok {
+		if _, ok := s.AccessValid(ctx, access); ok {
 			t.Fatal("access half survived unlink")
 		}
-		if _, ok := s.RefreshValid(ctx, "r2"); ok {
+		if _, ok := s.RefreshValid(ctx, refresh); ok {
 			t.Fatal("refresh half survived unlink")
 		}
 	})
 
 	t.Run(name+"/overwrite", func(t *testing.T) {
 		s := open(t)
-		if err := s.Link(ctx, "a3", "r3", "u3", time.Minute, time.Hour); err != nil {
+		access, first, second, user := uuid.NewString(), uuid.NewString(), uuid.NewString(), uuid.NewString()
+		if err := s.Link(ctx, access, first, user, time.Minute, time.Hour); err != nil {
 			t.Fatal(err)
 		}
-		if err := s.Link(ctx, "a3", "r4", "u3", time.Minute, time.Hour); err != nil {
+		if err := s.Link(ctx, access, second, user, time.Minute, time.Hour); err != nil {
 			t.Fatal(err)
 		}
-		if rjti, ok := s.AccessValid(ctx, "a3"); !ok || rjti != "r4" {
+		if rjti, ok := s.AccessValid(ctx, access); !ok || rjti != second {
 			t.Fatalf("overwrite access = %q,%v", rjti, ok)
 		}
 	})
 
 	t.Run(name+"/consume-single-use", func(t *testing.T) {
 		s := open(t)
-		if err := s.Link(ctx, "a4", "r4", "u4", time.Minute, time.Hour); err != nil {
+		access, refresh, user := uuid.NewString(), uuid.NewString(), uuid.NewString()
+		if err := s.Link(ctx, access, refresh, user, time.Minute, time.Hour); err != nil {
 			t.Fatal(err)
 		}
-		ajti, ok, err := s.ConsumeRefresh(ctx, "r4")
-		if err != nil || !ok || ajti != "a4" {
+		ajti, ok, err := s.ConsumeRefresh(ctx, refresh)
+		if err != nil || !ok || ajti != access {
 			t.Fatalf("consume = %q,%v,%v", ajti, ok, err)
 		}
-		if _, ok, _ := s.ConsumeRefresh(ctx, "r4"); ok {
+		if _, ok, _ := s.ConsumeRefresh(ctx, refresh); ok {
 			t.Fatal("replay consumed twice")
 		}
-		if _, ok := s.AccessValid(ctx, "a4"); ok {
+		if _, ok := s.AccessValid(ctx, access); ok {
 			t.Fatal("access half survived consume")
 		}
-		if _, ok := s.RefreshValid(ctx, "r4"); ok {
+		if _, ok := s.RefreshValid(ctx, refresh); ok {
 			t.Fatal("refresh half survived consume")
 		}
 	})
 
 	t.Run(name+"/replace-single-use", func(t *testing.T) {
 		s := open(t)
-		if err := s.Link(ctx, "a5", "r5", "u5", time.Minute, time.Hour); err != nil {
+		access, refresh, user := uuid.NewString(), uuid.NewString(), uuid.NewString()
+		if err := s.Link(ctx, access, refresh, user, time.Minute, time.Hour); err != nil {
 			t.Fatal(err)
 		}
-		old, ok, err := s.ReplaceRefresh(ctx, "r5", "a6", "r6", "u5", time.Minute, time.Hour)
-		if err != nil || !ok || old != "a5" {
+		newAccess, newRefresh := uuid.NewString(), uuid.NewString()
+		old, ok, err := s.ReplaceRefresh(ctx, refresh, newAccess, newRefresh, user, time.Minute, time.Hour)
+		if err != nil || !ok || old != access {
 			t.Fatalf("replace = %q,%v,%v", old, ok, err)
 		}
-		if _, ok := s.AccessValid(ctx, "a5"); ok {
+		if _, ok := s.AccessValid(ctx, access); ok {
 			t.Fatal("old access half survived replacement")
 		}
-		if _, ok := s.RefreshValid(ctx, "r5"); ok {
+		if _, ok := s.RefreshValid(ctx, refresh); ok {
 			t.Fatal("old refresh half survived replacement")
 		}
-		if got, ok := s.RefreshValid(ctx, "r6"); !ok || got != "a6" {
+		if got, ok := s.RefreshValid(ctx, newRefresh); !ok || got != newAccess {
 			t.Fatalf("replacement halves = %q,%v", got, ok)
 		}
-		if _, ok, _ := s.ReplaceRefresh(ctx, "r5", "a7", "r7", "u5", time.Minute, time.Hour); ok {
+		if _, ok, _ := s.ReplaceRefresh(ctx, refresh, uuid.NewString(), uuid.NewString(), user, time.Minute, time.Hour); ok {
 			t.Fatal("replay replaced twice")
 		}
 	})
@@ -191,6 +201,32 @@ func TestSession(t *testing.T) {
 		}
 	})
 
+	t.Run("file/caps-sessions-after-prune", func(t *testing.T) {
+		oldMax := maxFileSessions
+		maxFileSessions = 2
+		t.Cleanup(func() { maxFileSessions = oldMax })
+		s := &fileStore{dir: t.TempDir(), now: time.Now}
+		ctx := context.Background()
+		// Fill with one live and one expired session.
+		if err := s.Link(ctx, "live", "r1", "u", time.Hour, time.Hour); err != nil {
+			t.Fatal(err)
+		}
+		if err := s.Link(ctx, "dead", "r2", "u", -time.Hour, -time.Hour); err != nil {
+			t.Fatal(err)
+		}
+		// At capacity: the expired file is pruned, the new link succeeds.
+		if err := s.Link(ctx, "next", "r3", "u", time.Hour, time.Hour); err != nil {
+			t.Fatalf("prune should make room: %v", err)
+		}
+		if _, ok := s.AccessValid(ctx, "next"); !ok {
+			t.Fatal("new session should be valid")
+		}
+		// Still at capacity with no expired files left: refuse.
+		if err := s.Link(ctx, "overflow", "r4", "u", time.Hour, time.Hour); err == nil {
+			t.Fatal("expected full-store error")
+		}
+	})
+
 	t.Run("file/rejects-bad-dir", func(t *testing.T) {
 		blocker := filepath.Join(t.TempDir(), "blocker")
 		if err := os.WriteFile(blocker, []byte("x"), 0o644); err != nil {
@@ -259,10 +295,12 @@ func TestSession(t *testing.T) {
 		)`
 		indexes := []string{}
 		if driver == "pgsql" {
+			// Mirrors the goose migration: UUID columns, not CHAR(36)
+			// (CHAR pads on read and breaks JTI comparisons).
 			create = `CREATE TABLE sessions (
-				id CHAR(36) PRIMARY KEY,
-				user_id CHAR(36) NULL,
-				refresh_jti CHAR(36) NOT NULL,
+				id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+				user_id UUID NULL,
+				refresh_jti UUID NOT NULL,
 				access_expires_at TIMESTAMPTZ,
 				refresh_expires_at TIMESTAMPTZ
 			)`
@@ -282,6 +320,11 @@ func TestSession(t *testing.T) {
 		t.Cleanup(func() { _ = db.Exec(`DROP TABLE IF EXISTS sessions`).Error })
 		conformance(t, "database", func(t *testing.T) Store {
 			t.Helper()
+			// Fresh table per subtest: hardcoded JTIs repeat across
+			// subtests, and rows would otherwise leak between them.
+			if err := db.Exec(`DELETE FROM sessions`).Error; err != nil {
+				t.Fatal(err)
+			}
 			return Database(db)
 		})
 	})
