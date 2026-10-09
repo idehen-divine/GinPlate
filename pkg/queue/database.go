@@ -9,16 +9,10 @@ import (
 	"gorm.io/gorm/clause"
 )
 
-// retryAfter bounds how long a reservation may run before another worker
-// may take the job. It must exceed any plausible handler runtime; crashed
-// workers' jobs become eligible again after this window instead of
-// sticking forever. Configure via SetReservationTimeout or QUEUE_RESERVE_AFTER_SEC;
-// handlers exceeding the window may execute concurrently, so all handlers
-// must be idempotent or implement lease renewal.
+// retryAfter bounds reservations; handlers outliving it may run concurrently,
+// so all handlers must be idempotent.
 var retryAfter = 60 * time.Second
 
-// SetReservationTimeout overrides the reservation visibility window (for
-// tests and long-running-job deployments). Values <= 0 restore 60s.
 func SetReservationTimeout(d time.Duration) {
 	if d <= 0 {
 		d = 60 * time.Second
@@ -26,8 +20,6 @@ func SetReservationTimeout(d time.Duration) {
 	retryAfter = d
 }
 
-// jobRow maps the jobs migration table. Attempts counts pops including the
-// current one; a NULL reserved_at means never reserved or released back.
 type jobRow struct {
 	ID          string    `gorm:"primaryKey;size:36"`
 	Name        string    `gorm:"size:64;not null"`
@@ -40,15 +32,12 @@ type jobRow struct {
 
 func (jobRow) TableName() string { return "jobs" }
 
-// databaseQueue is a Queue over the jobs table. Reservation takes the
-// oldest due job under SKIP LOCKED so concurrent workers never share one.
 type databaseQueue struct {
 	db    *gorm.DB
 	tries int
 	now   func() time.Time
 }
 
-// NewDatabase returns a table-backed Queue. tries caps total runs (min 1).
 func NewDatabase(db *gorm.DB, tries int) Queue {
 	if tries < 1 {
 		tries = 1
@@ -56,7 +45,6 @@ func NewDatabase(db *gorm.DB, tries int) Queue {
 	return &databaseQueue{db: db, tries: tries, now: time.Now}
 }
 
-// Push inserts a first-attempt job due immediately.
 func (q *databaseQueue) Push(ctx context.Context, name string, payload []byte) (string, error) {
 	id := uuidString()
 	row := jobRow{ID: id, Name: name, Payload: payload, AvailableAt: q.now()}
@@ -66,7 +54,6 @@ func (q *databaseQueue) Push(ctx context.Context, name string, payload []byte) (
 	return id, nil
 }
 
-// Reserve takes the oldest due, unreserved-or-stale job and counts the pop.
 func (q *databaseQueue) Reserve(ctx context.Context) (Job, bool, error) {
 	var row jobRow
 	now := q.now()
@@ -90,13 +77,10 @@ func (q *databaseQueue) Reserve(ctx context.Context) (Job, bool, error) {
 	return Job{ID: row.ID, Name: row.Name, Payload: row.Payload, Attempts: row.Attempts, AvailableAt: row.AvailableAt}, true, nil
 }
 
-// Ack deletes a finished job.
 func (q *databaseQueue) Ack(ctx context.Context, id string) error {
 	return q.db.WithContext(ctx).Where("id = ?", id).Delete(&jobRow{}).Error
 }
 
-// Fail requeues with backoff and releases the reservation, or deletes past
-// max attempts and reports ErrJobBuried so the worker logs it distinctly.
 func (q *databaseQueue) Fail(ctx context.Context, job Job, _ error) error {
 	if job.Attempts >= q.tries {
 		if err := q.db.WithContext(ctx).Where("id = ?", job.ID).Delete(&jobRow{}).Error; err != nil {
@@ -104,7 +88,7 @@ func (q *databaseQueue) Fail(ctx context.Context, job Job, _ error) error {
 		}
 		return ErrJobBuried
 	}
-	return q.db.WithContext(ctx).Where("id = ?", job.ID).
+	return q.db.WithContext(ctx).Model(&jobRow{}).Where("id = ?", job.ID).
 		Updates(map[string]interface{}{
 			"available_at": q.now().Add(retryDelay(job.Attempts)),
 			"reserved_at":  nil,

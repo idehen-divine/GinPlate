@@ -1,13 +1,7 @@
-// Package scheduler fires registered entries on cron specs by pushing
-// jobs onto the queue broker, Laravel-style. Handlers stay ordinary queue
-// handlers in internal/jobs; entries self-register via Schedule in init(),
-// mirroring queue.Handle, so generated job files are self-contained.
-//
-// Overlap follows Laravel: entries overlap by default; WithoutOverlapping
-// holds a lock for the whole run (released by the worker on settle, TTL as
-// crash safety), OnOneServer locks only the fire decision so a fleet of
-// schedulers fires once. Both need a shared locker (RedisLocker) to mean
-// anything across processes; MemoryLocker guards a single process.
+// Package scheduler fires registered entries on cron specs by pushing jobs
+// onto the queue broker. Entries overlap by default; WithoutOverlapping
+// holds a lock for the whole run, OnOneServer only for the fire decision.
+// Fleet-wide locks need RedisLocker; MemoryLocker guards one process.
 package scheduler
 
 import (
@@ -22,22 +16,17 @@ import (
 	"github.com/idehen-divine/GinPlate/pkg/queue"
 )
 
-// DefaultExpireAfter caps an overlap lock like Laravel's 24h default: a
-// crashed worker can delay a schedule, never wedge it forever.
+// DefaultExpireAfter caps an overlap lock so a crash delays, never wedges.
 const DefaultExpireAfter = 24 * time.Hour
 
-// serverLockTTL covers one fire decision plus Push. It is deliberately
-// short: onOneServer must not block later ticks if a scheduler dies
-// mid-push.
+// serverLockTTL covers one fire decision plus Push.
 const serverLockTTL = 2 * time.Minute
 
-// tickInterval spaces fire checks. Minute granularity matches cron specs
-// and Laravel's scheduler cadence.
+// tickInterval spaces fire checks.
 const tickInterval = time.Minute
 
-// Entry is one recurring push: when Spec is due, Job is pushed with
-// Payload. Name defaults to Job; set it explicitly when two entries push
-// the same job (lock keys derive from Name).
+// Entry is one recurring push. Name defaults to Job; set it when two
+// entries push the same job (lock keys derive from Name).
 type Entry struct {
 	Name        string
 	Job         string
@@ -48,45 +37,33 @@ type Entry struct {
 	ExpireAfter time.Duration
 }
 
-// New starts an entry pushing job. Chain a Spec builder (EveryMinute,
-// Hourly, DailyAt, Weekly, Cron), then overlap flags.
 func New(job string) *Entry {
 	return &Entry{Name: job, Job: job}
 }
 
-// Named overrides the entry name (lock keys + logs).
 func (e *Entry) Named(name string) *Entry { e.Name = name; return e }
 
-// WithPayload sets the bytes pushed on every fire.
 func (e *Entry) WithPayload(p []byte) *Entry { e.Payload = p; return e }
 
-// EveryMinute fires each minute.
 func (e *Entry) EveryMinute() *Entry { e.Spec = "* * * * *"; return e }
 
-// Hourly fires at minute 0 of every hour.
 func (e *Entry) Hourly() *Entry { e.Spec = "0 * * * *"; return e }
 
-// DailyAt fires at h:m every day.
 func (e *Entry) DailyAt(h, m int) *Entry { e.Spec = fmt.Sprintf("%d %d * * *", m, h); return e }
 
-// Weekly fires at h:m on weekday (time.Sunday = 0).
 func (e *Entry) Weekly(day time.Weekday, h, m int) *Entry {
 	e.Spec = fmt.Sprintf("%d %d * * %d", m, h, int(day))
 	return e
 }
 
-// Cron sets a raw 5-field spec, validated at Schedule/Prepare time.
 func (e *Entry) Cron(expr string) *Entry { e.Spec = expr; return e }
 
-// WithoutOverlapping skips ticks while a previous run is unsettled. The
-// lock is held until the worker settles the job; ExpireAfter bounds it.
+// WithoutOverlapping skips ticks while a previous run is unsettled.
 func (e *Entry) WithoutOverlapping() *Entry { e.Overlap = true; return e }
 
-// OnOneServer fires once per tick across scheduler replicas. It locks only
-// the fire decision, so slow runs still overlap on the firing replica.
+// OnOneServer fires once per tick across replicas (locks only the decision).
 func (e *Entry) OnOneServer() *Entry { e.OneServer = true; return e }
 
-// WithExpireAfter bounds an overlap lock (default DefaultExpireAfter).
 func (e *Entry) WithExpireAfter(d time.Duration) *Entry { e.ExpireAfter = d; return e }
 
 var (
@@ -94,19 +71,15 @@ var (
 	entries []Entry
 )
 
-// Registry is an explicit per-application schedule. Prefer it over the
-// package-global Schedule/Registered helpers (kept for generated code):
-// explicit registries isolate tests and multiple app instances in one
-// process instead of sharing global state.
+// Registry is an explicit per-application schedule (isolates tests and
+// multiple app instances sharing one process).
 type Registry struct {
 	mu      sync.RWMutex
 	entries []Entry
 }
 
-// NewRegistry returns an empty schedule registry.
 func NewRegistry() *Registry { return &Registry{} }
 
-// Add registers entries on this registry.
 func (r *Registry) Add(es ...*Entry) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -117,17 +90,13 @@ func (r *Registry) Add(es ...*Entry) {
 	}
 }
 
-// All returns the registry entries in registration order.
 func (r *Registry) All() []Entry {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return append([]Entry(nil), r.entries...)
 }
 
-// Schedule registers entries, usually from init() in internal/jobs.
-// Specs and job names are validated when the scheduler prepares to run.
-// Entries are copied: later mutation of the builder does not affect the
-// registered schedule.
+// Schedule registers entries (usually from init()); validated at Prepare.
 func Schedule(es ...*Entry) {
 	regMu.Lock()
 	defer regMu.Unlock()
@@ -138,27 +107,23 @@ func Schedule(es ...*Entry) {
 	}
 }
 
-// Registered returns the init-collected entries in registration order.
 func Registered() []Entry {
 	regMu.RLock()
 	defer regMu.RUnlock()
 	return append([]Entry(nil), entries...)
 }
 
-// prepared is an entry with its parsed spec and last-fire time.
 type prepared struct {
 	entry Entry
 	sched cron.Schedule
 	last  time.Time
 }
 
-// State is a prepared schedule ready to tick.
 type State struct {
 	items []prepared
 }
 
-// Prepare validates entries (known job names, parseable specs) and stamps
-// last-fire at now, so booting the scheduler never backfires missed ticks.
+// Prepare validates entries and stamps last-fire at now (no backfiring).
 func Prepare(es []Entry, reg *queue.Registry, now time.Time) (*State, error) {
 	st := &State{}
 	for _, e := range es {
@@ -176,18 +141,14 @@ func Prepare(es []Entry, reg *queue.Registry, now time.Time) (*State, error) {
 	return st, nil
 }
 
-// due reports whether the next fire after last is at or before now.
 func due(p prepared, now time.Time) bool {
 	return !p.sched.Next(p.last).After(now)
 }
 
-// overlapKey and serverKey namespace the two lock kinds per entry.
 func overlapKey(name string) string { return "sched:overlap:" + name }
 func serverKey(name string) string  { return "sched:server:" + name }
 
 // CheckAndFire pushes every due entry and advances its last-fire clock.
-// OneServer entries take a short decision lock; Overlap entries hold their
-// lock until the worker settles the job (see ReleaseHook).
 func (s *State) CheckAndFire(ctx context.Context, q queue.Queue, locker Locker, now time.Time, logf func(format string, args ...interface{})) error {
 	for i := range s.items {
 		p := &s.items[i]
@@ -230,8 +191,7 @@ func (s *State) CheckAndFire(ctx context.Context, q queue.Queue, locker Locker, 
 			payload = wrapPayload(e.Payload, overlapKey(e.Name), token)
 			id, err := q.Push(ctx, e.Job, payload)
 			if err != nil {
-				// Release the just-acquired lock: a transient push
-				// failure must not wedge the entry until the TTL.
+				// Release the just-acquired lock so a push failure can't wedge the entry.
 				releaseCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				_ = locker.Release(releaseCtx, overlapKey(e.Name), token)
 				cancel()
@@ -249,11 +209,8 @@ func (s *State) CheckAndFire(ctx context.Context, q queue.Queue, locker Locker, 
 	return nil
 }
 
-// Run prepares the registered entries and ticks until ctx ends. A failed
-// tick (broker hiccup, lock error) logs and continues on the next tick
-// instead of killing the scheduler: transient outages must delay fires,
-// never stop them. Only Prepare failures (bad specs, unknown jobs) are
-// fatal, since those never heal without a code change.
+// Run prepares the registered entries and ticks until ctx ends. Failed ticks
+// log and continue; only Prepare failures (bad specs, unknown jobs) are fatal.
 func Run(ctx context.Context, q queue.Queue, locker Locker, logf func(format string, args ...interface{})) error {
 	st, err := Prepare(Registered(), queue.Default(), time.Now())
 	if err != nil {
@@ -277,9 +234,6 @@ func Run(ctx context.Context, q queue.Queue, locker Locker, logf func(format str
 	}
 }
 
-// envelope wraps a scheduled payload with its overlap-lock identity so the
-// worker can release the lock when the job settles. Plain entries push raw
-// payloads; only overlap-protected entries carry the envelope.
 type envelope struct {
 	Data  json.RawMessage `json:"data"`
 	Sched *schedMeta      `json:"sched,omitempty"`
@@ -298,8 +252,7 @@ func wrapPayload(data []byte, lock, token string) []byte {
 	return raw
 }
 
-// Data unwraps a scheduled payload for handlers: envelope payloads yield
-// their inner data, plain payloads pass through untouched.
+// Data unwraps a scheduled payload (plain payloads pass through).
 func Data(payload []byte) []byte {
 	var env envelope
 	if err := json.Unmarshal(payload, &env); err != nil || env.Sched == nil {
@@ -308,10 +261,8 @@ func Data(payload []byte) []byte {
 	return []byte(env.Data)
 }
 
-// ReleaseHook returns a queue.OnSettled hook releasing overlap locks named
-// in settled payloads. Wire it into the worker process (see app.RunWorker):
-// the scheduler process only acquires, the worker releases on ack, fail, or
-// burial, so a dead job never wedges its schedule past the TTL.
+// ReleaseHook returns a queue.OnSettled hook releasing overlap locks. Wire it
+// into the worker: the scheduler acquires, the worker releases on settle.
 func ReleaseHook(locker Locker, logf func(format string, args ...interface{})) queue.OnSettled {
 	return func(job queue.Job) {
 		var env envelope

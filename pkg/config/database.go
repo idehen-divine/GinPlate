@@ -13,9 +13,7 @@ import (
 	"github.com/spf13/viper"
 )
 
-// Database holds the primary database connection plus the shared Redis
-// connection. Like Laravel's database.php, Redis lives here: sessions,
-// cache, and queue all read the same address.
+// Database holds the primary DB plus the shared Redis connection.
 type Database struct {
 	Driver  string `mapstructure:"DB_CONNECTION"`
 	Host    string `mapstructure:"DB_HOST"`
@@ -24,30 +22,25 @@ type Database struct {
 	User    string `mapstructure:"DB_USERNAME"`
 	Pass    string `mapstructure:"DB_PASSWORD"`
 	LogMode string `mapstructure:"DB_LOG_MODE"`
-	// SSLMode controls transport encryption. PostgreSQL maps to the
-	// `sslmode` URL parameter. MySQL maps to a
-	// `tls` DSN profile: false (plaintext), skip-verify (encrypted,
-	// unverified), or ginplate-verify (encrypted AND verified against
-	// system CAs plus DB_SSLROOTCERT, with SNI/verification against
-	// DB_SSLSERVERNAME or DB_HOST). verify-full and verify-ca both select
-	// the verifying profile; require/preferred/true select skip-verify and
-	// are rejected in production, because "encrypted" must never be mistaken
-	// for "verified". See Validate.
+	// Pool bounds are shared by every replica against the same database:
+	// size them for replica count, not just one process.
+	MaxOpenConns    int `mapstructure:"DB_MAX_OPEN_CONNS"`
+	MaxIdleConns    int `mapstructure:"DB_MAX_IDLE_CONNS"`
+	ConnMaxLifetime int `mapstructure:"DB_CONN_MAX_LIFETIME_SEC"`
+	ConnMaxIdleTime int `mapstructure:"DB_CONN_MAX_IDLE_TIME_SEC"`
+	// SSLMode controls transport encryption. Only verify-full/verify-ca (and
+	// verify_identity) verify; require/preferred/true mean encrypted but
+	// unverified and are rejected in production. See Validate.
 	SSLMode string `mapstructure:"DB_SSLMODE"`
-	// SSLRootCert is an optional PEM bundle appended to the system CA pool
-	// for MySQL verification (e.g. a private or RDS CA). Empty means the
-	// system pool alone.
+	// SSLRootCert is an optional PEM bundle added to the system CA pool.
 	SSLRootCert string `mapstructure:"DB_SSLROOTCERT"`
-	// SSLServerName overrides the TLS ServerName used for MySQL
-	// verification. Empty means DB_HOST.
+	// SSLServerName overrides the TLS ServerName. Empty means DB_HOST.
 	SSLServerName string `mapstructure:"DB_SSLSERVERNAME"`
 
 	Redis Redis `mapstructure:",squash"`
 }
 
-// Redis holds the shared Redis connection. REDIS_CLIENT is accepted and
-// ignored (Go has no phpredis). User/DB select the ACL identity and logical
-// database; empty user means no ACL auth, DB 0 is the default index.
+// Redis holds the shared Redis connection.
 type Redis struct {
 	Host string `mapstructure:"REDIS_HOST"`
 	Port string `mapstructure:"REDIS_PORT"`
@@ -64,6 +57,10 @@ func applyDatabaseDefaults(v *viper.Viper) {
 	v.SetDefault("DB_USERNAME", "root")
 	v.SetDefault("DB_PASSWORD", "")
 	v.SetDefault("DB_LOG_MODE", "info")
+	v.SetDefault("DB_MAX_OPEN_CONNS", 20)
+	v.SetDefault("DB_MAX_IDLE_CONNS", 5)
+	v.SetDefault("DB_CONN_MAX_LIFETIME_SEC", 1800)
+	v.SetDefault("DB_CONN_MAX_IDLE_TIME_SEC", 300)
 	v.SetDefault("DB_SSLMODE", "disable")
 	v.SetDefault("DB_SSLROOTCERT", "")
 	v.SetDefault("DB_SSLSERVERNAME", "")
@@ -74,16 +71,11 @@ func applyDatabaseDefaults(v *viper.Viper) {
 	v.SetDefault("REDIS_DB", 0)
 }
 
-// mysqlVerifyProfile is the registered MySQL TLS profile that encrypts
-// AND verifies: system CAs plus DB_SSLROOTCERT, ServerName verification,
-// InsecureSkipVerify left false. It is the only MySQL profile that counts
-// as verified; tls=true/skip-verify do not verify.
+// mysqlVerifyProfile is the only MySQL TLS profile that verifies.
 const mysqlVerifyProfile = "ginplate-verify"
 
-// registerMySQLVerifyTLS registers (or re-registers) the verifying MySQL
-// TLS profile for serverName with the system CA pool plus rootCertPEM.
-// Re-registration overwrites the same key, so repeated DSN builds with one
-// configuration are safe. mysql.RegisterTLSConfig is internally locked.
+// registerMySQLVerifyTLS registers the verifying MySQL TLS profile
+// (re-registration overwrites, so repeated DSN builds are safe).
 func registerMySQLVerifyTLS(serverName, rootCertPEM string) error {
 	pool, err := x509.SystemCertPool()
 	if err != nil || pool == nil {
@@ -108,11 +100,27 @@ func registerMySQLVerifyTLS(serverName, rootCertPEM string) error {
 	})
 }
 
-// mysqlTLSParam maps DB_SSLMODE to a `tls` DSN profile name. Verification
-// is explicit: only verify-full/verify-ca/verify_identity select the
-// verifying profile (registered as a side effect); require/preferred/true
-// mean "encrypted, unverified" and map to skip-verify; everything else is
-// plaintext. Production accepts only the verifying modes (see Validate).
+// ValidateTLS registers the verifying MySQL TLS profile when DB_SSLMODE
+// asks for verification. Call at boot: verifying configs must fail fast on
+// bad CA/server names instead of silently downgrading.
+func (d Database) ValidateTLS() error {
+	if normalizeDriver(d.Driver) != "mysql" {
+		return nil
+	}
+	switch strings.ToLower(strings.TrimSpace(d.SSLMode)) {
+	case "verify-full", "verify-ca", "verify_identity":
+		serverName := strings.TrimSpace(d.SSLServerName)
+		if serverName == "" {
+			serverName = d.Host
+		}
+		if err := registerMySQLVerifyTLS(serverName, strings.TrimSpace(d.SSLRootCert)); err != nil {
+			return fmt.Errorf("config: DB_SSLMODE verification: %w", err)
+		}
+	}
+	return nil
+}
+
+// mysqlTLSParam maps DB_SSLMODE to a `tls` DSN profile name.
 func (d Database) mysqlTLSParam() string {
 	switch strings.ToLower(strings.TrimSpace(d.SSLMode)) {
 	case "verify-full", "verify-ca", "verify_identity":
@@ -121,10 +129,10 @@ func (d Database) mysqlTLSParam() string {
 			serverName = d.Host
 		}
 		if err := registerMySQLVerifyTLS(serverName, strings.TrimSpace(d.SSLRootCert)); err != nil {
-			// DSN has no error return and Validate rejects unreadable CA
-			// paths at boot; fall back to unverified rather than plaintext
-			// so a late failure still encrypts.
-			return "skip-verify"
+			// Never downgrade: return the verify profile anyway so the
+			// driver fails to connect instead of going unverified. Boot
+			// validation (ValidateTLS) catches this first with a clear error.
+			return mysqlVerifyProfile
 		}
 		return mysqlVerifyProfile
 	case "require", "preferred", "true":
@@ -136,12 +144,7 @@ func (d Database) mysqlTLSParam() string {
 	}
 }
 
-// DSN assembles the GORM DSN from parts. MySQL is built with the driver's
-// mysql.Config so credentials follow driver parsing rules (passwords may
-// contain @ : / ? % and spaces; the username portion may not contain ':',
-// which is the user/password separator by DSN grammar); Postgres uses URL
-// form with url.UserPassword (required for app-role swapping on pgsql).
-// Transport encryption follows DB_SSLMODE.
+// DSN assembles the GORM DSN from parts (passwords may contain @ : / ? %).
 func (d Database) DSN() string {
 	sslMode := strings.TrimSpace(d.SSLMode)
 	if sslMode == "" {
@@ -172,8 +175,6 @@ func (d Database) DSN() string {
 	return mc.FormatDSN()
 }
 
-// normalizeDriver maps engine names to canonical "mysql"|"pgsql".
-// (Local copy: config must not pull in goose via pkg/database.)
 func normalizeDriver(s string) string {
 	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "pgsql", "postgres", "postgresql", "pgx":
@@ -183,7 +184,6 @@ func normalizeDriver(s string) string {
 	}
 }
 
-// Addr assembles host:port for the Redis client. Empty password means no AUTH.
 func (r Redis) Addr() string {
 	return r.Host + ":" + r.Port
 }

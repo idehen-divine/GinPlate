@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,10 +12,12 @@ import (
 	"time"
 )
 
-// DefaultDir is used when the file driver gets an empty directory.
 const DefaultDir = "storage/framework/sessions"
 
-// fileSession is the on-disk shape: one JSON file per access jti.
+// maxFileSessions caps file-driver sessions (var for tests). Development
+// sessions must not grow without bound: refresh scans the directory.
+var maxFileSessions = 10000
+
 type fileSession struct {
 	RefreshJTI       string    `json:"refresh_jti"`
 	UserID           string    `json:"user_id"`
@@ -22,20 +25,15 @@ type fileSession struct {
 	RefreshExpiresAt time.Time `json:"refresh_expires_at"`
 }
 
-// fileStore is a Store backed by one JSON file per session. Reads scan the
-// directory for the refresh half, so this driver suits single-instance dev,
-// not high-traffic fleets. Development-only: files are 0600 under a 0700
-// directory, and refresh consumes are serialized by mu within one process;
-// the driver does not coordinate across processes or replicas.
+// fileStore is a development-only Store (one JSON file per session, no
+// cross-process coordination).
 type fileStore struct {
 	dir string
 	now func() time.Time
 	mu  sync.Mutex
 }
 
-// File returns a file-backed Store rooted at dir (created on demand).
-// An empty dir selects DefaultDir. Development-only: not suitable for
-// multi-user hosts or multi-instance production (no shared revocation).
+// File returns a file-backed Store rooted at dir (development-only).
 func File(dir string) (Store, error) {
 	if strings.TrimSpace(dir) == "" {
 		dir = DefaultDir
@@ -46,15 +44,18 @@ func File(dir string) (Store, error) {
 	return &fileStore{dir: dir, now: time.Now}, nil
 }
 
-// path maps an access jti to its file.
 func (s *fileStore) path(accessJti string) string {
 	return filepath.Join(s.dir, accessJti+".json")
 }
 
-// Link writes the session file.
 func (s *fileStore) Link(_ context.Context, accessJti, refreshJti, userID string, accessTTL, refreshTTL time.Duration) error {
 	if accessJti == "" || refreshJti == "" {
 		return errors.New("session: empty session id")
+	}
+	if entries, err := os.ReadDir(s.dir); err == nil && len(entries) >= maxFileSessions {
+		if pruned := s.pruneExpired(); pruned == 0 {
+			return fmt.Errorf("session: file store full (%d sessions)", maxFileSessions)
+		}
 	}
 	now := s.now()
 	raw, err := json.Marshal(fileSession{
@@ -69,7 +70,32 @@ func (s *fileStore) Link(_ context.Context, accessJti, refreshJti, userID string
 	return os.WriteFile(s.path(accessJti), raw, 0o600)
 }
 
-// read loads and expiry-checks a session file, deleting it when expired.
+// pruneExpired deletes expired session files, returning the count removed.
+func (s *fileStore) pruneExpired() int {
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		return 0
+	}
+	now := s.now()
+	pruned := 0
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		raw, err := os.ReadFile(filepath.Join(s.dir, e.Name()))
+		if err != nil {
+			continue
+		}
+		var fs fileSession
+		if err := json.Unmarshal(raw, &fs); err != nil || !live(fs, false, now) {
+			if os.Remove(filepath.Join(s.dir, e.Name())) == nil {
+				pruned++
+			}
+		}
+	}
+	return pruned
+}
+
 func (s *fileStore) read(accessJti string) (fileSession, bool) {
 	var fs fileSession
 	raw, err := os.ReadFile(s.path(accessJti))
@@ -82,7 +108,6 @@ func (s *fileStore) read(accessJti string) (fileSession, bool) {
 	return fs, true
 }
 
-// live reports whether the half pair is still valid at now.
 func live(fs fileSession, access bool, now time.Time) bool {
 	if access {
 		return now.Before(fs.AccessExpiresAt)
@@ -90,7 +115,6 @@ func live(fs fileSession, access bool, now time.Time) bool {
 	return now.Before(fs.RefreshExpiresAt)
 }
 
-// AccessValid returns the linked refresh jti for a live access half.
 func (s *fileStore) AccessValid(_ context.Context, accessJti string) (string, bool) {
 	if accessJti == "" || strings.ContainsAny(accessJti, `/\.`) {
 		return "", false
@@ -105,8 +129,6 @@ func (s *fileStore) AccessValid(_ context.Context, accessJti string) (string, bo
 	return fs.RefreshJTI, true
 }
 
-// RefreshValid scans session files for a live refresh half and returns its
-// access jti.
 func (s *fileStore) RefreshValid(_ context.Context, refreshJti string) (string, bool) {
 	if refreshJti == "" {
 		return "", false
@@ -132,8 +154,6 @@ func (s *fileStore) RefreshValid(_ context.Context, refreshJti string) (string, 
 	return "", false
 }
 
-// Unlink deletes the access file and any file linked to the refresh half.
-// Missing files are not errors; other removal failures are returned.
 func (s *fileStore) Unlink(_ context.Context, accessJti, refreshJti string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -152,12 +172,8 @@ func (s *fileStore) Unlink(_ context.Context, accessJti, refreshJti string) erro
 	return nil
 }
 
-// ReplaceRefresh validates the old refresh half and records the
-// replacement session in one mutex-guarded step. The old file is consumed
-// first so concurrent callers cannot both succeed; if the replacement write
-// then fails, the rotation reports an error and the user must re-login
-// (fail closed). Single process only; cross-process rotation still needs
-// redis or database.
+// ReplaceRefresh validates and replaces in one mutex-guarded step (fail
+// closed; single process only).
 func (s *fileStore) ReplaceRefresh(_ context.Context, oldRefreshJti, newAccessJti, newRefreshJti, userID string, accessTTL, refreshTTL time.Duration) (string, bool, error) {
 	if oldRefreshJti == "" || newAccessJti == "" || newRefreshJti == "" {
 		return "", false, errEmptySessionID
@@ -187,9 +203,6 @@ func (s *fileStore) ReplaceRefresh(_ context.Context, oldRefreshJti, newAccessJt
 	return oldAccessJti, true, nil
 }
 
-// ConsumeRefresh validates the refresh half and deletes the session in one
-// mutex-guarded step so concurrent callers cannot both succeed. Single
-// process only; cross-process rotation still needs redis or database.
 func (s *fileStore) ConsumeRefresh(_ context.Context, refreshJti string) (string, bool, error) {
 	if refreshJti == "" {
 		return "", false, nil
@@ -206,7 +219,6 @@ func (s *fileStore) ConsumeRefresh(_ context.Context, refreshJti string) (string
 	return accessJti, true, nil
 }
 
-// refreshValidLocked is RefreshValid without locking (caller holds mu).
 func (s *fileStore) refreshValidLocked(refreshJti string) (string, bool) {
 	entries, err := os.ReadDir(s.dir)
 	if err != nil {

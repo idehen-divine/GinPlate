@@ -1,13 +1,6 @@
-// Package logger provides a Zap-backed application logger with adapters
-// for Gin (access logs) and GORM (SQL logs).
-//
-// Behavior:
-//   - Every line goes to stdout and to the daily file
-//     <dir>/YYYY-MM-DD.logs (server-local days), created on demand.
-//   - An empty dir disables file logging (stdout only).
-//   - Files older than 7 days are deleted when the logger starts.
-//   - LOG_LEVEL gates verbosity (debug/info/warn/error).
-//   - Production uses JSON encoding, development human-readable output.
+// Package logger provides a Zap-backed logger with Gin and GORM adapters.
+// Lines go to stdout plus daily files (7-day retention); empty dir means
+// stdout only. Production encodes JSON, development is human-readable.
 package logger
 
 import (
@@ -26,17 +19,13 @@ import (
 	gormlogger "gorm.io/gorm/logger"
 )
 
-// Logger wraps a sugared Zap logger.
 type Logger struct {
 	*zap.SugaredLogger
 	zapLogger *zap.Logger
 }
 
-// New builds a logger for env ("development"/"production") with the given
-// level. Every line goes to stdout and to the daily file in dir (server
-// local days, YYYY-MM-DD.logs, 7-day retention). An empty dir means stdout
-// only. A dir that cannot be created falls back to stdout with a stderr
-// warning instead of failing.
+// New builds a logger for env with level, writing to stdout plus output dir.
+// An uncreatable dir falls back to stdout with a stderr warning.
 func New(env, level, output string) *Logger {
 	lvl := parseLevel(level)
 	var cfg zap.Config
@@ -60,7 +49,7 @@ func New(env, level, output string) *Logger {
 		zapcore.NewCore(enc, zapcore.Lock(os.Stdout), atomic),
 	}
 	if output != "" {
-		if err := os.MkdirAll(output, 0o755); err != nil {
+		if err := os.MkdirAll(output, 0o700); err != nil {
 			fmt.Fprintf(os.Stderr, "logger: cannot create log dir %q: %v (stdout only)\n", output, err)
 		} else {
 			pruneOldLogs(output, time.Now())
@@ -75,26 +64,18 @@ func New(env, level, output string) *Logger {
 	return &Logger{SugaredLogger: zl.Sugar(), zapLogger: zl}
 }
 
-// NewNop returns a no-op logger for tests.
 func NewNop() *Logger {
 	zl := zap.NewNop()
 	return &Logger{SugaredLogger: zl.Sugar(), zapLogger: zl}
 }
 
-// Sync flushes buffered output. Call on shutdown (safe to ignore errors).
+// Sync flushes buffered output. Call on shutdown.
 func (l *Logger) Sync() { _ = l.zapLogger.Sync() }
 
-// retainLogDays is how many daily files the log dir holds; older files are
-// deleted when the logger starts.
 const retainLogDays = 7
 
-// logFileRe matches YYYY-MM-DD.logs exactly. Anything else in the dir is
-// left alone by rotation and pruning.
 var logFileRe = regexp.MustCompile(`^(\d{4})-(\d{2})-(\d{2})\.logs$`)
 
-// dailyWriter is an io.Writer appending to <dir>/YYYY-MM-DD.logs in server
-// local time, rotating to a new file when the day rolls over. Safe for
-// concurrent use.
 type dailyWriter struct {
 	mu   sync.Mutex
 	dir  string
@@ -103,9 +84,8 @@ type dailyWriter struct {
 	file *os.File
 }
 
-// Write appends p to today's file, rotating first when the day changed. A
-// rotation failure drops the line (stdout still carries it) rather than
-// blocking logging.
+// Write appends p to today's file. Rotation failure drops the line (stdout
+// still carries it) rather than blocking.
 func (w *dailyWriter) Write(p []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -118,16 +98,15 @@ func (w *dailyWriter) Write(p []byte) (int, error) {
 	return w.file.Write(p)
 }
 
-// rotate closes the current file, if any, and opens <dir>/<day>.logs.
 func (w *dailyWriter) rotate(day string) error {
 	if w.file != nil {
 		_ = w.file.Close()
 		w.file = nil
 	}
-	if err := os.MkdirAll(w.dir, 0o755); err != nil {
+	if err := os.MkdirAll(w.dir, 0o700); err != nil {
 		return err
 	}
-	f, err := os.OpenFile(filepath.Join(w.dir, day+".logs"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	f, err := os.OpenFile(filepath.Join(w.dir, day+".logs"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return err
 	}
@@ -135,7 +114,6 @@ func (w *dailyWriter) rotate(day string) error {
 	return nil
 }
 
-// Sync flushes the current file to disk. Missing file is success.
 func (w *dailyWriter) Sync() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -145,8 +123,6 @@ func (w *dailyWriter) Sync() error {
 	return w.file.Sync()
 }
 
-// pruneOldLogs deletes YYYY-MM-DD.logs files older than the 7 newest days,
-// keeping today plus the previous six. Unparseable names are ignored.
 func pruneOldLogs(dir string, now time.Time) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -172,7 +148,6 @@ func pruneOldLogs(dir string, now time.Time) {
 	}
 }
 
-// GinWriter returns an io.Writer routing Gin access logs through Zap.
 func (l *Logger) GinWriter() io.Writer {
 	if l == nil || l.SugaredLogger == nil {
 		return os.Stdout
@@ -182,7 +157,6 @@ func (l *Logger) GinWriter() io.Writer {
 
 type zapWriter struct{ l *Logger }
 
-// Write satisfies io.Writer so Gin access logs flow through Zap.
 func (w zapWriter) Write(p []byte) (int, error) {
 	msg := strings.TrimSpace(string(p))
 	if msg != "" {
@@ -191,8 +165,6 @@ func (w zapWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// GormLogger returns a GORM logger.Interface writing slow/error SQL via Zap.
-// slowThreshold marks queries slower than d as warnings.
 func (l *Logger) GormLogger(level gormlogger.LogLevel, slowThreshold time.Duration) gormlogger.Interface {
 	if l == nil || l.SugaredLogger == nil {
 		return gormlogger.Default.LogMode(level)
@@ -255,7 +227,6 @@ func (a *gormAdapter) Trace(_ context.Context, begin time.Time, fc func() (strin
 	}
 }
 
-// parseLevel maps a LOG_LEVEL name to a Zap level, defaulting to info.
 func parseLevel(s string) zapcore.Level {
 	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "debug":
