@@ -346,3 +346,50 @@ func quoteIdent(s string) string {
 	}
 	return s
 }
+
+// EnsureAppRole creates the limited application role (when configured) and
+// grants it full rights on one database, so row-level-security policies
+// constrain the runtime instead of being bypassed by owner credentials.
+// Empty user is a no-op. Identifiers are identRe-validated; passwords travel
+// as placeholders.
+func EnsureAppRole(driver, serverGormDSN, dbName, user, pass string) error {
+	if strings.TrimSpace(user) == "" {
+		return nil
+	}
+	driver = NormalizeDriver(driver)
+	if !identRe.MatchString(dbName) || quoteIdent(user) == "" {
+		return fmt.Errorf("invalid database or role name")
+	}
+	db, err := Open(driver, ServerDSN(driver, serverGormDSN))
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), migrationTimeout)
+	defer cancel()
+	if driver == "pgsql" {
+		var one int
+		if err := db.QueryRowContext(ctx, `SELECT 1 FROM pg_roles WHERE rolname = $1`, user).Scan(&one); err != nil {
+			if _, err := db.ExecContext(ctx, fmt.Sprintf(`CREATE ROLE "%s" LOGIN PASSWORD '%s'`, user, escapeLiteral(pass))); err != nil {
+				return err
+			}
+		}
+		if _, err := db.ExecContext(ctx, fmt.Sprintf(`GRANT ALL ON DATABASE "%s" TO "%s"`, dbName, user)); err != nil {
+			return err
+		}
+		return nil
+	}
+	// CREATE USER cannot run in the prepared-statement protocol, so the
+	// identRe-validated user and escaped password interpolate directly.
+	if _, err := db.ExecContext(ctx, fmt.Sprintf("CREATE USER IF NOT EXISTS '%s'@'%%' IDENTIFIED BY '%s'", user, escapeLiteral(pass))); err != nil {
+		return err
+	}
+	_, err = db.ExecContext(ctx, fmt.Sprintf("GRANT ALL PRIVILEGES ON `%s`.* TO '%s'@'%%'", dbName, user))
+	return err
+}
+
+// escapeLiteral doubles single quotes for string literals that cannot use
+// placeholders (role passwords in CREATE statements).
+func escapeLiteral(s string) string {
+	return strings.ReplaceAll(s, `'`, `''`)
+}
