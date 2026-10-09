@@ -8,12 +8,12 @@ import (
 )
 
 // NewServeCmd runs the API server (ginplate serve).
-func NewServeCmd(cfg *config.Config) *cobra.Command {
+func NewServeCmd(config *config.Config) *cobra.Command {
 	return &cobra.Command{
 		Use:   "serve",
 		Short: "Run the API server",
 		RunE: func(_ *cobra.Command, _ []string) error {
-			return app.RunAPI(cfg)
+			return app.RunAPI(config)
 		},
 	}
 }

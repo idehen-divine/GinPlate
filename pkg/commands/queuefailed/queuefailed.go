@@ -16,38 +16,36 @@ import (
 	redisPkg "github.com/idehen-divine/GinPlate/pkg/redis"
 )
 
-// store opens the failed-jobs table. A missing table is a usage error, not
-// a crash: it means the failed_jobs migration never ran.
-func store(cfg *config.Config) (queue.FailedStore, *gorm.DB, error) {
-	db, err := database.Connect(cfg.Database.Driver, cfg.Database.DSN())
+// store opens the failed-jobs table (missing = migration never ran).
+func store(config *config.Config) (queue.FailedStore, *gorm.DB, error) {
+	databaseConnection, err := database.Connect(config.Database.Driver, config.Database.DSN())
 	if err != nil {
 		return nil, nil, fmt.Errorf("database: %w", err)
 	}
-	if !db.Migrator().HasTable("failed_jobs") {
+	if !databaseConnection.Migrator().HasTable("failed_jobs") {
 		return nil, nil, fmt.Errorf("no failed_jobs table: run `ginplate migrate up` first")
 	}
-	return queue.NewDatabaseFailedStore(db), db, nil
+	return queue.NewDatabaseFailedStore(databaseConnection), databaseConnection, nil
 }
 
-func closeDB(db *gorm.DB) {
-	if sqlDB, err := db.DB(); err == nil {
-		_ = sqlDB.Close()
+func closeDB(databaseConnection *gorm.DB) {
+	if sqlDatabase, err := databaseConnection.DB(); err == nil {
+		_ = sqlDatabase.Close()
 	}
 }
 
-// NewQueueFailedCmd shows buried jobs: id, job, attempts, when, and the
-// exception that killed each (truncated for the table).
-func NewQueueFailedCmd(cfg *config.Config) *cobra.Command {
+// NewQueueFailedCmd lists buried jobs.
+func NewQueueFailedCmd(config *config.Config) *cobra.Command {
 	var limit int
 	cmd := &cobra.Command{
 		Use:   "queue:failed",
 		Short: "List buried jobs",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			s, db, err := store(cfg)
+			s, databaseConnection, err := store(config)
 			if err != nil {
 				return err
 			}
-			defer closeDB(db)
+			defer closeDB(databaseConnection)
 			jobs, err := s.List(context.Background(), limit)
 			if err != nil {
 				return err
@@ -72,28 +70,28 @@ func NewQueueFailedCmd(cfg *config.Config) *cobra.Command {
 	return cmd
 }
 
-// NewQueueRetryCmd re-pushes a buried job (or all) onto the live broker and
-// deletes its row. The job runs fresh: attempts restart at 1.
-func NewQueueRetryCmd(cfg *config.Config) *cobra.Command {
+// NewQueueRetryCmd re-queues a buried job (or all) with attempts reset.
+func NewQueueRetryCmd(config *config.Config) *cobra.Command {
 	return &cobra.Command{
 		Use:   "queue:retry <id|all>",
 		Short: "Re-queue a buried job (or all)",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			s, db, err := store(cfg)
+			s, databaseConnection, err := store(config)
 			if err != nil {
 				return err
 			}
-			defer closeDB(db)
+			defer closeDB(databaseConnection)
 			ctx := context.Background()
 			var jobs []queue.FailedJob
 			if args[0] == "all" {
-				// List caps a single call, so drain page by page: push and
-				// delete each page before reading the next.
-				q, err := openBroker(cfg)
+				// Drain page by page (List caps a single call).
+				broker, err := openBroker(config)
 				if err != nil {
 					return err
 				}
+				defer func() { _ = broker.Close() }()
+				q := broker.Queue
 				total := 0
 				for {
 					page, err := s.List(ctx, 500)
@@ -128,10 +126,12 @@ func NewQueueRetryCmd(cfg *config.Config) *cobra.Command {
 				cmd.Println("nothing to retry")
 				return nil
 			}
-			q, err := openBroker(cfg)
+			broker, err := openBroker(config)
 			if err != nil {
 				return err
 			}
+			defer func() { _ = broker.Close() }()
+			q := broker.Queue
 			var ids []string
 			for _, j := range jobs {
 				if _, err := q.Push(ctx, j.Name, j.Payload); err != nil {
@@ -148,18 +148,18 @@ func NewQueueRetryCmd(cfg *config.Config) *cobra.Command {
 	}
 }
 
-// NewQueueForgetCmd deletes one buried job without retrying it.
-func NewQueueForgetCmd(cfg *config.Config) *cobra.Command {
+// NewQueueForgetCmd deletes one buried job without retrying.
+func NewQueueForgetCmd(config *config.Config) *cobra.Command {
 	return &cobra.Command{
 		Use:   "queue:forget <id>",
 		Short: "Delete a buried job",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			s, db, err := store(cfg)
+			s, databaseConnection, err := store(config)
 			if err != nil {
 				return err
 			}
-			defer closeDB(db)
+			defer closeDB(databaseConnection)
 			if err := s.Delete(context.Background(), args[0]); err != nil {
 				return err
 			}
@@ -169,9 +169,8 @@ func NewQueueForgetCmd(cfg *config.Config) *cobra.Command {
 	}
 }
 
-// NewQueueFlushCmd deletes every buried job. Refuses without --force, like
-// other destructive commands.
-func NewQueueFlushCmd(cfg *config.Config) *cobra.Command {
+// NewQueueFlushCmd deletes every buried job (requires --force).
+func NewQueueFlushCmd(config *config.Config) *cobra.Command {
 	var force bool
 	cmd := &cobra.Command{
 		Use:   "queue:flush",
@@ -180,11 +179,11 @@ func NewQueueFlushCmd(cfg *config.Config) *cobra.Command {
 			if !force {
 				return fmt.Errorf("refusing without --force (deletes every buried job)")
 			}
-			s, db, err := store(cfg)
+			s, databaseConnection, err := store(config)
 			if err != nil {
 				return err
 			}
-			defer closeDB(db)
+			defer closeDB(databaseConnection)
 			if err := s.Flush(context.Background()); err != nil {
 				return err
 			}
@@ -196,28 +195,54 @@ func NewQueueFlushCmd(cfg *config.Config) *cobra.Command {
 	return cmd
 }
 
-// openBroker connects the live queue broker for retries, mirroring the
-// worker's wiring: only the selected driver is dialed. Sync retries
-// dispatch inline through the registered handlers (blank-imported above),
-// like any other sync push.
-func openBroker(cfg *config.Config) (queue.Queue, error) {
-	if cfg.Queue.Connection == "redis" {
-		client := redisPkg.DialOrNil(cfg.Database.Redis, 10*time.Second)
+// BrokerResources owns the live queue broker plus any client opened for
+// it, so retry commands close exactly what they dialed.
+type BrokerResources struct {
+	Queue queue.Queue
+	Close func() error
+}
+
+func noopClose() error { return nil }
+
+// openBroker connects the live queue broker for retries (selected driver only).
+func openBroker(config *config.Config) (BrokerResources, error) {
+	if config.Queue.Connection == "redis" {
+		client := redisPkg.DialOrNil(config.Database.Redis, 10*time.Second)
 		if client == nil {
-			return nil, fmt.Errorf("redis unreachable at %s", cfg.Database.Redis.Addr())
+			return BrokerResources{}, fmt.Errorf("redis unreachable at %s", config.Database.Redis.Addr())
 		}
-		return queue.Open(cfg.Queue, nil, client)
-	}
-	var db *gorm.DB
-	if cfg.Queue.Connection == "database" {
-		var err error
-		db, err = database.Connect(cfg.Database.Driver, cfg.Database.DSN())
+		q, err := queue.Open(config.Queue, nil, client)
 		if err != nil {
-			return nil, fmt.Errorf("database: %w", err)
+			_ = client.Close()
+			return BrokerResources{}, err
+		}
+		return BrokerResources{Queue: q, Close: client.Close}, nil
+	}
+	var databaseConnection *gorm.DB
+	if config.Queue.Connection == "database" {
+		var err error
+		databaseConnection, err = database.Connect(config.Database.Driver, config.Database.DSN())
+		if err != nil {
+			return BrokerResources{}, fmt.Errorf("database: %w", err)
 		}
 	}
-	if cfg.Queue.Connection == "" || cfg.Queue.Connection == "sync" {
-		return queue.NewSync(queue.Default()), nil
+	if config.Queue.Connection == "" || config.Queue.Connection == "sync" {
+		return BrokerResources{Queue: queue.NewSync(queue.Default()), Close: noopClose}, nil
 	}
-	return queue.Open(cfg.Queue, db, nil)
+	q, err := queue.Open(config.Queue, databaseConnection, nil)
+	if err != nil {
+		if databaseConnection != nil {
+			if sqlDatabase, serr := databaseConnection.DB(); serr == nil {
+				_ = sqlDatabase.Close()
+			}
+		}
+		return BrokerResources{}, err
+	}
+	return BrokerResources{Queue: q, Close: func() error {
+		sqlDatabase, err := databaseConnection.DB()
+		if err != nil {
+			return err
+		}
+		return sqlDatabase.Close()
+	}}, nil
 }

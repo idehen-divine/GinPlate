@@ -11,20 +11,19 @@ import (
 	"github.com/idehen-divine/GinPlate/pkg/queue"
 )
 
-// NewMailTestCmd builds `ginplate mail:test --to a@b.c`: sends the Welcome
-// mailable through the configured MAIL_MAILER (or via the queued job path
-// with --queue) to verify delivery without touching code.
-func NewMailTestCmd(cfg *config.Config) *cobra.Command {
+// NewMailTestCmd builds `ginplate mail:test`: sends the Welcome mailable
+// through the configured mailer (--queue for the queued path).
+func NewMailTestCmd(config *config.Config) *cobra.Command {
 	var to, subject string
 	var useQueue bool
 	cmd := &cobra.Command{
 		Use:   "mail:test",
 		Short: "Send a test email through the configured mailer",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			if cfg == nil {
+			if config == nil {
 				return fmt.Errorf("config not loaded: check .env (APP_KEY required)")
 			}
-			mailable := welcome.Welcome{AppName: cfg.App.Name, Name: "Tester", Email: to, AppURL: cfg.App.URL}
+			mailable := welcome.Welcome{AppName: config.App.Name, Name: "Tester", Email: to, AppURL: config.App.URL}
 			msg, err := mailable.Build()
 			if err != nil {
 				return err
@@ -32,18 +31,17 @@ func NewMailTestCmd(cfg *config.Config) *cobra.Command {
 			if subject != "" {
 				msg.Subject = subject
 			}
-			sender, err := mail.OpenSender(cfg.Mail, cfg.Filesystem.S3)
+			sender, err := mail.OpenSender(config.Mail, config.Filesystem.S3)
 			if err != nil {
 				return err
 			}
 			if !useQueue {
 				return sender.Send(cmd.Context(), msg)
 			}
-			// Queued path: an in-memory broker bound to the mail handler,
-			// exercising job encode -> dispatch -> Send without a broker.
+			// Queued path exercises encode -> dispatch -> Send without a broker.
 			reg := queue.NewRegistry()
 			mail.Register(reg, sender)
-			m, err := mail.Open(cfg.Mail, cfg.Filesystem.S3, queue.NewSync(reg))
+			m, err := mail.Open(config.Mail, config.Filesystem.S3, queue.NewSync(reg))
 			if err != nil {
 				return err
 			}

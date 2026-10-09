@@ -10,13 +10,11 @@ import (
 	"github.com/idehen-divine/GinPlate/pkg/web"
 )
 
-// maintenancePath resolves the marker path and driver, tolerating a nil
-// config: down/up are config-free commands (they must run even when config
-// is broken), so compiled-in defaults apply. With no config, raw
-// environment variables still win over those defaults.
-func maintenancePath(cfg *config.Config) (path, driver string) {
+// maintenancePath resolves the marker path and driver (nil config tolerated:
+// down/up must run even when config is broken).
+func maintenancePath(config *config.Config) (path, driver string) {
 	path, driver = "storage/framework/down", "file"
-	if cfg == nil {
+	if config == nil {
 		if p := os.Getenv("APP_MAINTENANCE_PATH"); p != "" {
 			path = p
 		}
@@ -25,26 +23,24 @@ func maintenancePath(cfg *config.Config) (path, driver string) {
 		}
 		return path, driver
 	}
-	if cfg.App.Maintenance.Path != "" {
-		path = cfg.App.Maintenance.Path
+	if config.App.Maintenance.Path != "" {
+		path = config.App.Maintenance.Path
 	}
-	if cfg.App.Maintenance.Driver != "" {
-		driver = cfg.App.Maintenance.Driver
+	if config.App.Maintenance.Driver != "" {
+		driver = config.App.Maintenance.Driver
 	}
 	return path, driver
 }
 
-// NewDownCmd builds `ginplate down`: writes the maintenance marker so the
-// API 503s every request until `ginplate up`. Only the file driver is
-// supported; anything else in APP_MAINTENANCE_DRIVER is refused.
-func NewDownCmd(cfg *config.Config) *cobra.Command {
+// NewDownCmd builds `ginplate down`: API 503s every request until `ginplate up`.
+func NewDownCmd(config *config.Config) *cobra.Command {
 	var secret, message string
 	var retry int
 	cmd := &cobra.Command{
 		Use:   "down",
 		Short: "Put the API into maintenance mode",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			path, driver := maintenancePath(cfg)
+			path, driver := maintenancePath(config)
 			if driver != "file" {
 				return fmt.Errorf("only the file maintenance driver is supported, got %q", driver)
 			}
@@ -57,19 +53,19 @@ func NewDownCmd(cfg *config.Config) *cobra.Command {
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&secret, "secret", "", "Bypass secret (?secret= / X-Maintenance-Bypass header)")
+	cmd.Flags().StringVar(&secret, "secret", "", "Bypass secret (X-Maintenance-Bypass header)")
 	cmd.Flags().IntVar(&retry, "retry", 60, "Retry-After seconds sent with 503s")
 	cmd.Flags().StringVar(&message, "message", "", "Custom 503 message (default built-in)")
 	return cmd
 }
 
-// NewUpCmd builds `ginplate up`: removes the maintenance marker.
-func NewUpCmd(cfg *config.Config) *cobra.Command {
+// NewUpCmd builds `ginplate up`: clears the maintenance marker.
+func NewUpCmd(config *config.Config) *cobra.Command {
 	return &cobra.Command{
 		Use:   "up",
 		Short: "Take the API out of maintenance mode",
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			path, _ := maintenancePath(cfg)
+			path, _ := maintenancePath(config)
 			if err := web.ClearDownFile(path); err != nil {
 				return err
 			}

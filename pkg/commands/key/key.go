@@ -10,9 +10,7 @@ import (
 )
 
 // NewKeyGenerateCmd builds `ginplate key:generate`: creates a random 32-byte
-// APP_KEY and writes it into the env file (updating the line if present,
-// appending otherwise). Run it once per environment; everyone sharing an
-// environment must share the key, or tokens won't verify across instances.
+// APP_KEY and writes it into the env file. Run once per environment.
 func NewKeyGenerateCmd() *cobra.Command {
 	var envFile string
 	var show bool
@@ -41,10 +39,8 @@ func NewKeyGenerateCmd() *cobra.Command {
 	return cmd
 }
 
-// writeFileSecure writes data with owner-only permissions. WriteFile's mode
-// applies only to newly created files, so the mode is enforced with Chmod
-// afterwards: rewriting an existing world-readable .env must not leave it
-// world-readable when it holds APP_KEY and database passwords.
+// writeFileSecure writes data with owner-only permissions (enforced via
+// Chmod, since WriteFile's mode applies only to new files).
 func writeFileSecure(path string, data []byte) error {
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		return err
@@ -52,9 +48,7 @@ func writeFileSecure(path string, data []byte) error {
 	return os.Chmod(path, 0o600)
 }
 
-// writeKey replaces the APP_KEY line in path, appends it when missing, or
-// creates the file with a header when absent. Other lines pass through
-// byte-identical.
+// writeKey replaces the APP_KEY line in path, appending when missing.
 func writeKey(path, key string) error {
 	data, err := os.ReadFile(path)
 	if err != nil && !os.IsNotExist(err) {
