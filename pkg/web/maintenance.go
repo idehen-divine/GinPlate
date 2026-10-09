@@ -1,6 +1,7 @@
 package web
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"net/http"
 	"os"
@@ -10,17 +11,13 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// DownState is the maintenance marker written by `ginplate down` and read
-// by Maintenance. Secret enables the bypass; Retry feeds the Retry-After
-// header; Message overrides the default 503 body.
 type DownState struct {
 	Secret  string `json:"secret,omitempty"`
 	Retry   int    `json:"retry,omitempty"`
 	Message string `json:"message,omitempty"`
 }
 
-// ReadDownFile returns the maintenance state when path exists. A missing
-// file is not an error — it simply means the app is up.
+// ReadDownFile returns the state when path exists; missing file means up.
 func ReadDownFile(path string) (*DownState, bool, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -36,7 +33,6 @@ func ReadDownFile(path string) (*DownState, bool, error) {
 	return &st, true, nil
 }
 
-// WriteDownFile creates parent dirs and writes the maintenance marker.
 func WriteDownFile(path string, st DownState) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
@@ -48,7 +44,6 @@ func WriteDownFile(path string, st DownState) error {
 	return os.WriteFile(path, raw, 0o644)
 }
 
-// ClearDownFile removes the maintenance marker. A missing file is success.
 func ClearDownFile(path string) error {
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return err
@@ -56,18 +51,26 @@ func ClearDownFile(path string) error {
 	return nil
 }
 
-// Maintenance rejects every request with 503 while the down file exists,
-// except callers presenting the bypass secret via ?secret= or the
-// X-Maintenance-Bypass header. Mount it before auth so maintenance covers
-// the whole API surface.
+// Maintenance 503s every request while the down file exists (bypass via
+// X-Maintenance-Bypass header only). Mount before auth.
 func Maintenance(path string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		st, down, err := ReadDownFile(path)
-		if err != nil || !down {
+		if err != nil {
+			// Fail closed: an unreadable marker must not silently serve
+			// traffic that should be under maintenance.
+			Fail(c, http.StatusServiceUnavailable, "Service temporarily unavailable.", nil)
+			c.Abort()
+			return
+		}
+		if !down {
 			c.Next()
 			return
 		}
-		if st.Secret != "" && (c.Query("secret") == st.Secret || c.GetHeader("X-Maintenance-Bypass") == st.Secret) {
+		// Bypass travels in a header only: query strings leak into access
+		// logs, proxy logs, browser history, and referrer telemetry.
+		// Compared in constant time; rotate the secret per incident.
+		if st.Secret != "" && subtle.ConstantTimeCompare([]byte(c.GetHeader("X-Maintenance-Bypass")), []byte(st.Secret)) == 1 {
 			c.Next()
 			return
 		}

@@ -11,20 +11,17 @@ import (
 	"github.com/idehen-divine/GinPlate/pkg/web"
 )
 
-// CORSConfig controls cross-origin behavior. Use "*" for local dev;
-// in production set explicit origins (e.g. https://app.example.com).
 type CORSConfig struct {
 	AllowedOrigins   []string
 	AllowCredentials bool
 }
 
-// CORS handles preflight and sets ACAO headers. An empty allow-list means
-// allow-all and is only appropriate for local development; production must
-// set explicit origins (validated at startup by config.Validate).
-func CORS(cfg CORSConfig) gin.HandlerFunc {
-	allowAll := len(cfg.AllowedOrigins) == 0
+// CORS handles preflight. Empty allow-list means allow-all (dev only;
+// production requires explicit origins).
+func CORS(config CORSConfig) gin.HandlerFunc {
+	allowAll := len(config.AllowedOrigins) == 0
 	allowed := map[string]bool{}
-	for _, o := range cfg.AllowedOrigins {
+	for _, o := range config.AllowedOrigins {
 		o = strings.TrimSpace(o)
 		if o != "" {
 			allowed[o] = true
@@ -40,14 +37,13 @@ func CORS(cfg CORSConfig) gin.HandlerFunc {
 				c.Next()
 				return
 			} else {
-				allowOrigin = cfg.AllowedOrigins[0]
+				allowOrigin = config.AllowedOrigins[0]
 			}
 		}
 		h := c.Writer.Header()
 		h.Set("Access-Control-Allow-Origin", allowOrigin)
-		// Caches must key on Origin when the value varies per caller.
 		h.Set("Vary", "Origin")
-		if cfg.AllowCredentials && allowOrigin != "*" {
+		if config.AllowCredentials && allowOrigin != "*" {
 			h.Set("Access-Control-Allow-Credentials", "true")
 		}
 		h.Set("Access-Control-Allow-Headers", "Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, accept, origin, Cache-Control, X-Requested-With")
@@ -61,7 +57,6 @@ func CORS(cfg CORSConfig) gin.HandlerFunc {
 	}
 }
 
-// Security sets baseline security headers.
 func Security() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		h := c.Writer.Header()
@@ -80,11 +75,20 @@ func Security() gin.HandlerFunc {
 	}
 }
 
-// RateLimit caps requests per second per instance (tollbooth, in-memory).
-// NOTE: per-instance only, not a distributed defense. For multi-replica
-// deployments add a Redis sliding-window limiter or enforce equivalent
-// controls at the API gateway, with stricter per-endpoint limits on
-// login, signup, refresh, password reset, and token-check endpoints.
+// RateLimit caps requests per second per instance (not distributed: use a
+// gateway limiter for multi-replica fleets).
+// MaxBodyBytes caps request body size via http.MaxBytesReader, so oversized
+// payloads are rejected before handlers or validation read them. Reads past
+// the limit fail binding, which handlers already render as 4xx.
+func MaxBodyBytes(limit int64) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if limit > 0 && c.Request.Body != nil {
+			c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, limit)
+		}
+		c.Next()
+	}
+}
+
 func RateLimit(requestsPerSecond float64) gin.HandlerFunc {
 	if requestsPerSecond <= 0 {
 		requestsPerSecond = 10
