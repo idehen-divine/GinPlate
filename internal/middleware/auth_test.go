@@ -211,6 +211,41 @@ func TestAuth(t *testing.T) {
 		}
 	})
 
+	t.Run("tenant-mismatch-rejected", func(t *testing.T) {
+		key := []byte("0123456789abcdef0123456789abcdef")
+		mint := func(tid string) string {
+			t.Helper()
+			tok := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+				"sub": uuid.NewString(), "jti": uuid.NewString(), "ver": TokenVersion,
+				"type": "access", "tid": tid,
+				"iat": time.Now().Unix(), "exp": time.Now().Add(time.Hour).Unix(),
+			})
+			signed, err := tok.SignedString(key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return signed
+		}
+		run := func(tid, tenantSlug string) *httptest.ResponseRecorder {
+			c, w := testCtx(t, "GET", "/users")
+			c.Request.Header.Set("Authorization", "Bearer "+mint(tid))
+			if tenantSlug != "" {
+				c.Set("tenantSlug", tenantSlug)
+			}
+			RequireAuth(key, nil)(c)
+			return w
+		}
+		if w := run("acme", "globex"); w.Code != http.StatusUnauthorized {
+			t.Fatalf("foreign tenant = %d, want 401", w.Code)
+		}
+		if w := run("acme", "acme"); w.Code == http.StatusUnauthorized {
+			t.Fatalf("matching tenant rejected: %d", w.Code)
+		}
+		if w := run("acme", ""); w.Code == http.StatusUnauthorized {
+			t.Fatalf("unresolved request rejected: %d", w.Code)
+		}
+	})
+
 	t.Run("wrong-alg-rejected", func(t *testing.T) {
 		key := []byte("0123456789abcdef0123456789abcdef")
 		tok := jwt.NewWithClaims(jwt.SigningMethodNone, jwt.MapClaims{

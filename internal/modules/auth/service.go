@@ -9,6 +9,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -21,6 +22,7 @@ import (
 	"github.com/idehen-divine/GinPlate/pkg/mail"
 	"github.com/idehen-divine/GinPlate/pkg/notify"
 	"github.com/idehen-divine/GinPlate/pkg/queue"
+	"github.com/idehen-divine/GinPlate/pkg/resettoken"
 	"github.com/idehen-divine/GinPlate/pkg/session"
 	"github.com/idehen-divine/GinPlate/pkg/web"
 	"golang.org/x/crypto/bcrypt"
@@ -30,9 +32,11 @@ import (
 // AuthService is the behavior boundary handlers depend on.
 type AuthService interface {
 	Register(db *gorm.DB, dto SignupDTO) (*users.User, error)
-	Login(db *gorm.DB, dto LoginDTO) (*users.User, *TokenPair, error)
+	Login(db *gorm.DB, dto LoginDTO, tenantSlug string) (*users.User, *TokenPair, error)
 	Logout(sessionID string) error
-	Refresh(db *gorm.DB, refreshToken string) (*users.User, *TokenPair, error)
+	Refresh(db *gorm.DB, refreshToken, tenantSlug string) (*users.User, *TokenPair, error)
+	ForgotPassword(db *gorm.DB, email string) error
+	ResetPassword(db *gorm.DB, rawToken, newPassword string) error
 	Check(token string) CheckResult
 }
 
@@ -131,9 +135,10 @@ func (s *Service) notifyWelcome(u *users.User) {
 	}
 }
 
-// Login verifies credentials and active status, then issues a token pair.
-// Failures share one message so callers can't probe which accounts exist.
-func (s *Service) Login(db *gorm.DB, dto LoginDTO) (*users.User, *TokenPair, error) {
+// Login verifies credentials and active status, then issues a token pair
+// bound to tenantSlug. Failures share one message so callers can't probe
+// which accounts exist.
+func (s *Service) Login(db *gorm.DB, dto LoginDTO, tenantSlug string) (*users.User, *TokenPair, error) {
 	var u users.User
 	if err := db.Where("email = ?", dto.Email).First(&u).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
@@ -147,7 +152,7 @@ func (s *Service) Login(db *gorm.DB, dto LoginDTO) (*users.User, *TokenPair, err
 	if !u.IsActive {
 		return nil, nil, web.Unauthorized("Invalid credentials.")
 	}
-	pair, err := s.issue(&u)
+	pair, err := s.issue(&u, tenantSlug)
 	if err != nil {
 		return nil, nil, web.Wrap(http.StatusInternalServerError, "Could not log in.", err)
 	}
@@ -155,14 +160,15 @@ func (s *Service) Login(db *gorm.DB, dto LoginDTO) (*users.User, *TokenPair, err
 }
 
 // mint signs a token pair without touching the store. The caller must persist
-// the JTIs: unstored JTIs never validate (fail closed).
-func (s *Service) mint(u *users.User) (pair *TokenPair, accessJti, refreshJti string, err error) {
+// the JTIs: unstored JTIs never validate (fail closed). tid binds both
+// tokens to one tenant (see RequireAuth).
+func (s *Service) mint(u *users.User, tenantSlug string) (pair *TokenPair, accessJti, refreshJti string, err error) {
 	jti := uuid.NewString()
 	rjti := uuid.NewString()
 	now := time.Now()
 	accessClaims := jwt.MapClaims{
 		"sub": u.ID.String(),
-		"jti": jti, "ver": "v1", "type": "access", "role": u.Role, "aver": u.AuthVersion,
+		"jti": jti, "ver": "v1", "type": "access", "role": u.Role, "tid": tenantSlug, "aver": u.AuthVersion,
 		"iat": now.Unix(), "exp": now.Add(s.accessTTL).Unix(),
 	}
 	access, err := jwt.NewWithClaims(jwt.SigningMethodHS256, accessClaims).SignedString(s.key)
@@ -171,7 +177,7 @@ func (s *Service) mint(u *users.User) (pair *TokenPair, accessJti, refreshJti st
 	}
 	refreshClaims := jwt.MapClaims{
 		"sub": u.ID.String(),
-		"jti": rjti, "ver": "v1", "type": "refresh", "role": u.Role, "aver": u.AuthVersion,
+		"jti": rjti, "ver": "v1", "type": "refresh", "role": u.Role, "tid": tenantSlug, "aver": u.AuthVersion,
 		"iat": now.Unix(), "exp": now.Add(s.refreshTTL).Unix(),
 	}
 	refresh, err := jwt.NewWithClaims(jwt.SigningMethodHS256, refreshClaims).SignedString(s.key)
@@ -183,8 +189,8 @@ func (s *Service) mint(u *users.User) (pair *TokenPair, accessJti, refreshJti st
 
 // issue mints a pair and links both session halves. A Link failure is
 // returned so untracked tokens are never handed out.
-func (s *Service) issue(u *users.User) (*TokenPair, error) {
-	pair, jti, rjti, err := s.mint(u)
+func (s *Service) issue(u *users.User, tenantSlug string) (*TokenPair, error) {
+	pair, jti, rjti, err := s.mint(u, tenantSlug)
 	if err != nil {
 		return nil, err // caller wraps with its operation message
 	}
@@ -211,7 +217,14 @@ func (s *Service) Logout(sessionID string) error {
 
 // Refresh rotates a refresh token into a new pair in one atomic replacement,
 // so exactly one concurrent use wins. Revoked or replayed tokens get 401.
-func (s *Service) Refresh(db *gorm.DB, refreshToken string) (*users.User, *TokenPair, error) {
+// The token's tid must match tenantSlug: cross-tenant replay gets 401
+// before any session or database access. An empty tenantSlug is a server
+// misconfiguration (unresolved tenant), so it fails 500 instead of
+// allowing tid=="" to match slug=="".
+func (s *Service) Refresh(db *gorm.DB, refreshToken, tenantSlug string) (*users.User, *TokenPair, error) {
+	if tenantSlug == "" {
+		return nil, nil, web.Wrap(http.StatusInternalServerError, "Could not refresh.", errors.New("tenant required"))
+	}
 	claims, err := s.parse(refreshToken)
 	if err != nil {
 		return nil, nil, web.Unauthorized("Invalid refresh token.")
@@ -221,6 +234,11 @@ func (s *Service) Refresh(db *gorm.DB, refreshToken string) (*users.User, *Token
 	}
 	rjti, _ := claims["jti"].(string)
 	if rjti == "" {
+		return nil, nil, web.Unauthorized("Invalid refresh token.")
+	}
+	// The refresh token is bound to the tenant that minted it: presenting
+	// it under another tenant is a cross-tenant replay, not a revocation.
+	if tid, _ := claims["tid"].(string); tid != tenantSlug {
 		return nil, nil, web.Unauthorized("Invalid refresh token.")
 	}
 	sub, _ := claims["sub"].(string)
@@ -249,7 +267,7 @@ func (s *Service) Refresh(db *gorm.DB, refreshToken string) (*users.User, *Token
 	if aver, _ := claims["aver"].(float64); int(aver) != u.AuthVersion {
 		return nil, nil, web.Unauthorized("Session revoked.")
 	}
-	pair, newAccessJti, newRefreshJti, err := s.mint(&u)
+	pair, newAccessJti, newRefreshJti, err := s.mint(&u, tenantSlug)
 	if err != nil {
 		return nil, nil, web.Wrap(http.StatusInternalServerError, "Could not refresh.", err)
 	}
@@ -264,6 +282,100 @@ func (s *Service) Refresh(db *gorm.DB, refreshToken string) (*users.User, *Token
 		}
 	}
 	return &u, pair, nil
+}
+
+// ForgotPassword issues a reset token for an active account and emails the
+// link. Unknown, inactive, or missing accounts return nil: callers always
+// report success so addresses can't be probed. Only transient backend
+// failures surface as errors.
+func (s *Service) ForgotPassword(db *gorm.DB, email string) error {
+	email = strings.ToLower(strings.TrimSpace(email))
+	if email == "" {
+		return nil
+	}
+	var u users.User
+	if err := db.Where("email = ?", email).First(&u).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil
+		}
+		return web.Wrap(http.StatusInternalServerError, "Could not request reset.", err)
+	}
+	if !u.IsActive {
+		return nil
+	}
+	ctx := context.Background()
+	raw, err := IssueResetToken(ctx, db, u.Email, ResetKindUser, ResetTokenTTL)
+	if err != nil {
+		return web.Wrap(http.StatusInternalServerError, "Could not request reset.", err)
+	}
+	if err := s.SendPasswordReset(ctx, s.appURL, u.Name, u.Email, raw, int(ResetTokenTTL.Minutes())); err != nil {
+		slog.Warn("password reset mail failed", "user", u.ID.String(), "err", err)
+	}
+	return nil
+}
+
+// ResetPassword consumes a reset token and sets a new password, revoking
+// every session for the account. Invalid and expired tokens share one
+// generic failure so tokens can't be probed.
+func (s *Service) ResetPassword(db *gorm.DB, rawToken, newPassword string) error {
+	if len(newPassword) < 8 {
+		return web.Wrap(http.StatusBadRequest, "Password must be at least 8 characters.", nil)
+	}
+	if strings.TrimSpace(rawToken) == "" {
+		return web.Wrap(http.StatusBadRequest, "Invalid or expired reset token.", nil)
+	}
+	ctx := context.Background()
+	email, err := s.emailForResetToken(ctx, db, rawToken)
+	if err != nil {
+		return err
+	}
+	var u users.User
+	if err := db.WithContext(ctx).Where("email = ?", email).First(&u).Error; err != nil {
+		return web.Wrap(http.StatusBadRequest, "Invalid or expired reset token.", nil)
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(newPassword), bcrypt.DefaultCost)
+	if err != nil {
+		return web.Wrap(http.StatusInternalServerError, "Could not reset password.", err)
+	}
+	if s.store != nil {
+		// Revoke first: revocation failure aborts before anything is
+		// consumed, so the token stays valid for a retry.
+		if err := s.store.RevokeUser(ctx, u.ID.String()); err != nil {
+			return web.Wrap(http.StatusInternalServerError, "Could not reset password.", err)
+		}
+	}
+	u.PasswordHash = string(hash)
+	if err := db.WithContext(ctx).Save(&u).Error; err != nil {
+		if errors.Is(err, gorm.ErrDuplicatedKey) {
+			return web.Wrap(http.StatusBadRequest, "Invalid or expired reset token.", nil)
+		}
+		return web.Wrap(http.StatusInternalServerError, "Could not reset password.", err)
+	}
+	if err := ConsumeResetToken(ctx, db, email, ResetKindUser, rawToken); err != nil {
+		if errors.Is(err, ErrResetInvalid) || errors.Is(err, ErrResetExpired) {
+			return web.Wrap(http.StatusBadRequest, "Invalid or expired reset token.", nil)
+		}
+		return web.Wrap(http.StatusInternalServerError, "Could not reset password.", err)
+	}
+	return nil
+}
+
+// emailForResetToken resolves the account address for a presented raw
+// token without consuming it, so revocation and the password update can
+// run first with a retry-safe token still in place.
+func (s *Service) emailForResetToken(ctx context.Context, db *gorm.DB, rawToken string) (string, error) {
+	generic := web.Wrap(http.StatusBadRequest, "Invalid or expired reset token.", nil)
+	var row ResetToken
+	if err := db.WithContext(ctx).
+		Where("kind = ? AND token_hash = ?", ResetKindUser, resettoken.Hash(rawToken)).
+		First(&row).Error; err != nil {
+		return "", generic
+	}
+	if !time.Now().Before(row.ExpiresAt) {
+		_ = db.WithContext(ctx).Where("email = ? AND kind = ?", row.Email, ResetKindUser).Delete(&ResetToken{}).Error
+		return "", generic
+	}
+	return row.Email, nil
 }
 
 type CheckResult struct {

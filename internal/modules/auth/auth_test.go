@@ -2,6 +2,8 @@ package auth
 
 import (
 	"context"
+	"errors"
+	"net/http"
 	"testing"
 	"time"
 
@@ -11,6 +13,7 @@ import (
 	"github.com/idehen-divine/GinPlate/internal/modules/users"
 	"github.com/idehen-divine/GinPlate/pkg/mail"
 	"github.com/idehen-divine/GinPlate/pkg/session"
+	"github.com/idehen-divine/GinPlate/pkg/web"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -58,7 +61,7 @@ func jtis(t *testing.T, secret []byte, pair *TokenPair) (string, string) {
 func TestAuth(t *testing.T) {
 	t.Run("issue-links-both-halves", func(t *testing.T) {
 		svc, store := testService(t)
-		pair, err := svc.issue(testUser())
+		pair, err := svc.issue(testUser(), "acme")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -74,7 +77,7 @@ func TestAuth(t *testing.T) {
 
 	t.Run("logout-kills-both-halves", func(t *testing.T) {
 		svc, store := testService(t)
-		pair, err := svc.issue(testUser())
+		pair, err := svc.issue(testUser(), "acme")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -92,7 +95,7 @@ func TestAuth(t *testing.T) {
 
 	t.Run("refresh-rejects-revoked", func(t *testing.T) {
 		svc, store := testService(t)
-		pair, err := svc.issue(testUser())
+		pair, err := svc.issue(testUser(), "acme")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -100,21 +103,21 @@ func TestAuth(t *testing.T) {
 		if err := store.Unlink(context.Background(), ajti, rjti); err != nil {
 			t.Fatal(err)
 		}
-		if _, _, err := svc.Refresh(nil, pair.RefreshToken); err == nil || err.Error() != "Session revoked." {
+		if _, _, err := svc.Refresh(nil, pair.RefreshToken, "acme"); err == nil || err.Error() != "Session revoked." {
 			t.Fatalf("revoked refresh: got %v, want Session revoked.", err)
 		}
 	})
 
 	t.Run("refresh-rejects-garbage", func(t *testing.T) {
 		svc, _ := testService(t)
-		if _, _, err := svc.Refresh(nil, "bogus.token.here"); err == nil {
+		if _, _, err := svc.Refresh(nil, "bogus.token.here", "acme"); err == nil {
 			t.Fatal("expected error for malformed token")
 		}
 	})
 
 	t.Run("refresh-single-use", func(t *testing.T) {
 		svc, store := testService(t)
-		pair, err := svc.issue(testUser())
+		pair, err := svc.issue(testUser(), "acme")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -159,8 +162,62 @@ func TestAuth(t *testing.T) {
 			t.Fatalf("replacement halves = %q,%v", got, ok)
 		}
 		// The consumed token now reports revoked through the service.
-		if _, _, err := svc.Refresh(nil, pair.RefreshToken); err == nil || err.Error() != "Session revoked." {
+		if _, _, err := svc.Refresh(nil, pair.RefreshToken, "acme"); err == nil || err.Error() != "Session revoked." {
 			t.Fatalf("replayed refresh: got %v, want Session revoked.", err)
+		}
+	})
+
+	t.Run("refresh-rejects-foreign-tenant", func(t *testing.T) {
+		svc, _ := testService(t)
+		pair, err := svc.issue(testUser(), "acme")
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Same token under another tenant: cross-tenant replay, rejected
+		// before any session or database access.
+		if _, _, err := svc.Refresh(nil, pair.RefreshToken, "globex"); err == nil || err.Error() != "Invalid refresh token." {
+			t.Fatalf("foreign refresh: got %v, want Invalid refresh token.", err)
+		}
+	})
+
+	t.Run("refresh-rejects-empty-slug", func(t *testing.T) {
+		svc, _ := testService(t)
+		pair, err := svc.issue(testUser(), "acme")
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Unresolved tenant is a server misconfiguration: 500, never 401.
+		_, _, err = svc.Refresh(nil, pair.RefreshToken, "")
+		var ae *web.AppError
+		if err == nil || !errors.As(err, &ae) || ae.Status != http.StatusInternalServerError {
+			t.Fatalf("empty-slug refresh: got %v, want 500", err)
+		}
+	})
+
+	t.Run("refresh-rejects-empty-slug-even-when-tid-empty", func(t *testing.T) {
+		svc, _ := testService(t)
+		pair, err := svc.issue(testUser(), "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		// tid=="" must not match slug=="": empty callers always fail 500.
+		_, _, err = svc.Refresh(nil, pair.RefreshToken, "")
+		var ae *web.AppError
+		if err == nil || !errors.As(err, &ae) || ae.Status != http.StatusInternalServerError {
+			t.Fatalf("empty==empty refresh: got %v, want 500", err)
+		}
+	})
+
+	t.Run("refresh-rejects-access-token", func(t *testing.T) {
+		svc, _ := testService(t)
+		pair, err := svc.issue(testUser(), "acme")
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Access tokens are never valid refresh tokens, even under the
+		// right tenant.
+		if _, _, err := svc.Refresh(nil, pair.AccessToken, "acme"); err == nil || err.Error() != "Invalid refresh token." {
+			t.Fatalf("access-as-refresh: got %v, want Invalid refresh token.", err)
 		}
 	})
 

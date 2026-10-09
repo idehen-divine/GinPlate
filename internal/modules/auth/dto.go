@@ -22,6 +22,15 @@ type RefreshDTO struct {
 	RefreshToken string `json:"refresh_token" binding:"required"`
 }
 
+type ForgotDTO struct {
+	Email string `json:"email" binding:"required,email"`
+}
+
+type ResetDTO struct {
+	Token       string `json:"token" binding:"required"`
+	NewPassword string `json:"new_password" binding:"required,min=8"`
+}
+
 type CheckDTO struct {
 	Token string `json:"token" binding:"required"`
 }

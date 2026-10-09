@@ -19,6 +19,7 @@ type Claims struct {
 	SessionID   string    `json:"jti"`
 	Version     string    `json:"ver"`
 	Role        Role      `json:"role"`
+	TenantID    string    `json:"tid"`
 	AuthVersion int       `json:"aver"`
 }
 
@@ -51,6 +52,7 @@ type TokenClaims struct {
 	Version     string `json:"ver"`
 	Type        string `json:"type"`
 	Role        Role   `json:"role"`
+	TenantID    string `json:"tid"`
 	AuthVersion int    `json:"aver"`
 }
 
@@ -78,6 +80,13 @@ func RequireAuth(key []byte, store session.Store) gin.HandlerFunc {
 			c.Abort()
 			return
 		}
+		if want, ok := c.Get("tenantSlug"); ok {
+			if slug, _ := want.(string); slug != "" && claims.TenantID != slug {
+				web.Fail(c, http.StatusUnauthorized, "Invalid token.", nil)
+				c.Abort()
+				return
+			}
+		}
 		if store != nil && claims.SessionID != "" {
 			if _, ok := store.AccessValid(c.Request.Context(), claims.SessionID); !ok {
 				web.Fail(c, http.StatusUnauthorized, "Session expired.", nil)
@@ -92,9 +101,9 @@ func RequireAuth(key []byte, store session.Store) gin.HandlerFunc {
 			return
 		}
 		c.Set("claims", &Claims{
-			UserID: uid,
+			UserID:    uid,
 			SessionID: claims.SessionID, Version: claims.Version, Role: claims.Role,
-			AuthVersion: claims.AuthVersion,
+			TenantID: claims.TenantID, AuthVersion: claims.AuthVersion,
 		})
 		if ActiveCheck != nil {
 			if err := ActiveCheck(c, uid); err != nil {

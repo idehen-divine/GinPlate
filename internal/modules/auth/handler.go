@@ -5,6 +5,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/idehen-divine/GinPlate/internal/middleware"
+	"github.com/idehen-divine/GinPlate/pkg/tenancy"
 	"github.com/idehen-divine/GinPlate/pkg/web"
 )
 
@@ -42,7 +43,7 @@ func (h *Handler) Login(c *gin.Context) {
 		web.ValidationErrors(c, err)
 		return
 	}
-	u, pair, err := h.service.Login(web.MustDB(c), dto)
+	u, pair, err := h.service.Login(web.MustDB(c), dto, tenancy.CurrentTenantSlug(c))
 	if err != nil {
 		web.Render(c, err)
 		return
@@ -85,7 +86,7 @@ func (h *Handler) Refresh(c *gin.Context) {
 		web.ValidationErrors(c, err)
 		return
 	}
-	u, pair, err := h.service.Refresh(web.MustDB(c), dto.RefreshToken)
+	u, pair, err := h.service.Refresh(web.MustDB(c), dto.RefreshToken, tenancy.CurrentTenantSlug(c))
 	if err != nil {
 		web.Render(c, err)
 		return
@@ -110,4 +111,40 @@ func (h *Handler) Check(c *gin.Context) {
 		return
 	}
 	web.Success(c, http.StatusOK, "Token valid.", result)
+}
+
+// @Summary Request password reset
+// @Tags Auth
+// @Param payload body ForgotDTO true "forgot"
+// @Success 200 {object} map[string]interface{}
+// @Router /auth/forgot [post]
+func (h *Handler) Forgot(c *gin.Context) {
+	var dto ForgotDTO
+	if err := c.ShouldBindJSON(&dto); err != nil {
+		web.ValidationErrors(c, err)
+		return
+	}
+	if err := h.service.ForgotPassword(web.MustDB(c), dto.Email); err != nil {
+		web.Render(c, err)
+		return
+	}
+	web.Success(c, http.StatusOK, "If an account exists, a reset link was sent.", nil)
+}
+
+// @Summary Reset password
+// @Tags Auth
+// @Param payload body ResetDTO true "reset"
+// @Success 200 {object} map[string]interface{}
+// @Router /auth/reset [post]
+func (h *Handler) Reset(c *gin.Context) {
+	var dto ResetDTO
+	if err := c.ShouldBindJSON(&dto); err != nil {
+		web.ValidationErrors(c, err)
+		return
+	}
+	if err := h.service.ResetPassword(web.MustDB(c), dto.Token, dto.NewPassword); err != nil {
+		web.Render(c, err)
+		return
+	}
+	web.Success(c, http.StatusOK, "Password reset.", nil)
 }
