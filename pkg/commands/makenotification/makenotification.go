@@ -12,13 +12,8 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// NewMakeNotificationCmd builds the `make:notification` generator:
-// `ginplate make:notification OrderShipped` writes
-// internal/notifications/order_shipped/order_shipped.go — its own directory
-// and Go package — containing a Notification stub fanning out to the
-// database and mail channels. Handlers then deliver it in one line:
-//
-//	notify.Send(ctx, notifier, to, ordershipped.OrderShipped{...})
+// NewMakeNotificationCmd builds the `make:notification` generator: scaffolds
+// a Notification stub fanning out to the database and mail channels.
 func NewMakeNotificationCmd() *cobra.Command {
 	var dir string
 	var force, dryRun bool
@@ -43,7 +38,6 @@ return that mailable from ToMail.`,
 	return cmd
 }
 
-// notificationNames holds the derived identifiers for a notification.
 type notificationNames struct {
 	Struct string // e.g. OrderShipped (notification struct)
 	Dir    string // e.g. order_shipped (subdirectory under --dir)
@@ -55,8 +49,7 @@ type notificationNames struct {
 
 var validNameRe = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]*$`)
 
-// deriveNames maps a user-supplied name (OrderShipped, order-shipped,
-// order_shipped) to struct, file, package, and type identifiers.
+// deriveNames maps a name in any style to struct, file, and package identifiers.
 func deriveNames(raw string) (notificationNames, error) {
 	raw = strings.TrimSpace(raw)
 	if !validNameRe.MatchString(raw) {
@@ -83,7 +76,6 @@ func deriveNames(raw string) (notificationNames, error) {
 	}, nil
 }
 
-// splitCamel splits "OrderShipped" into ["Order" "Shipped"].
 func splitCamel(s string) []string {
 	var words []string
 	start := 0
@@ -97,8 +89,6 @@ func splitCamel(s string) []string {
 	return append(words, s[start:])
 }
 
-// capitalize uppercases the first letter and lowercases the rest, turning a
-// word into its StudlyCase segment.
 func capitalize(s string) string {
 	if s == "" {
 		return s

@@ -1,10 +1,14 @@
 package makecommand
 
 import (
+	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/spf13/cobra"
 )
@@ -61,6 +65,7 @@ func TestMakeCommand(t *testing.T) {
 			`custom.RegisterCustom("send-report", newSendReportCmd)`,
 			"func newSendReportCmd() *cobra.Command",
 			`Use:   "send-report"`,
+			`is not implemented`,
 		} {
 			if !strings.Contains(s, want) {
 				t.Errorf("rendered source missing %q:\n%s", want, s)
@@ -120,6 +125,47 @@ func TestMakeCommand(t *testing.T) {
 		}
 		if strings.Contains(s, "empty-dir") || strings.Contains(s, "notes") {
 			t.Errorf("generated imports should skip dirs without Go files:\n%s", s)
+		}
+	})
+
+	t.Run("generated-compiles", func(t *testing.T) {
+		_, file, _, _ := runtime.Caller(0)
+		root := filepath.Join(filepath.Dir(file), "..", "..", "..")
+		absRoot, err := filepath.Abs(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cwd, err := os.Getwd()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chdir(absRoot); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chdir(cwd) })
+		// generated.go is rewritten by the generator: snapshot and restore.
+		genPath := filepath.Join("pkg", "commands", "generated.go")
+		prior, priorErr := os.ReadFile(genPath)
+		probeDir := filepath.Join("internal", "commands", "probe-command")
+		t.Cleanup(func() {
+			_ = os.RemoveAll(probeDir)
+			if priorErr != nil {
+				_ = os.Remove(genPath)
+			} else {
+				_ = os.WriteFile(genPath, prior, 0o644)
+			}
+		})
+		cmd := &cobra.Command{}
+		var sb strings.Builder
+		cmd.SetOut(&sb)
+		if err := generateCommand(cmd, filepath.Join("pkg", "commands"), filepath.Join("internal", "commands"), "ProbeCommand", true, false); err != nil {
+			t.Fatalf("generate: %v", err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		build := exec.CommandContext(ctx, "go", "build", "./internal/commands/probe-command/")
+		if out, err := build.CombinedOutput(); err != nil {
+			t.Fatalf("generated command does not compile: %v\n%s", err, out)
 		}
 	})
 }

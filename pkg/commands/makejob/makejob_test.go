@@ -1,10 +1,14 @@
 package makejob
 
 import (
+	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/spf13/cobra"
 )
@@ -64,6 +68,7 @@ func TestMakeJob(t *testing.T) {
 			"type BillingChargePayload struct",
 			"func BillingCharge(ctx context.Context, job queue.Job) error",
 			"json.Unmarshal(job.Payload, &payload)",
+			"is not implemented",
 		} {
 			if !strings.Contains(s, want) {
 				t.Errorf("rendered source missing %q:\n%s", want, s)
@@ -153,6 +158,37 @@ func TestMakeJob(t *testing.T) {
 		}
 		if err := generateJob(cmd, sub, "Billing.Charge", "", false, false); err == nil {
 			t.Error("expected exists error without --force")
+		}
+	})
+
+	t.Run("generated-compiles", func(t *testing.T) {
+		_, file, _, _ := runtime.Caller(0)
+		root := filepath.Join(filepath.Dir(file), "..", "..", "..")
+		absRoot, err := filepath.Abs(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cwd, err := os.Getwd()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chdir(absRoot); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chdir(cwd) })
+		probe := filepath.Join("internal", "jobs", "probe_compile_check.go")
+		t.Cleanup(func() { _ = os.Remove(probe) })
+		cmd := &cobra.Command{}
+		var sb strings.Builder
+		cmd.SetOut(&sb)
+		if err := generateJob(cmd, filepath.Join("internal", "jobs"), "ProbeCompileCheck", "", true, false); err != nil {
+			t.Fatalf("generate: %v", err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		build := exec.CommandContext(ctx, "go", "build", "./internal/jobs/")
+		if out, err := build.CombinedOutput(); err != nil {
+			t.Fatalf("generated job does not compile: %v\n%s", err, out)
 		}
 	})
 }

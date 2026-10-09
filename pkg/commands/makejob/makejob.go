@@ -12,11 +12,8 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// NewMakeJobCmd builds the `make:job` generator:
-// `ginplate make:job Billing.Charge` writes internal/jobs/billing_charge.go
-// containing a queue handler stub that self-registers via init(). With
-// --schedule the same file also registers a scheduler entry, so the job is
-// fully wired after the next build — no manual edits.
+// NewMakeJobCmd builds the `make:job` generator: scaffolds a
+// self-registering queue handler stub (--schedule adds a scheduler entry).
 func NewMakeJobCmd() *cobra.Command {
 	var dir, sched string
 	var force, dryRun bool
@@ -46,7 +43,6 @@ hourly, daily@HH:MM, weekly@Mon@HH:MM, cron:<5-field expr>.`,
 	return cmd
 }
 
-// jobNames holds the derived identifiers for a generated job.
 type jobNames struct {
 	Name      string // e.g. billing.charge (queue job name)
 	File      string // e.g. billing_charge.go
@@ -60,9 +56,7 @@ type jobNames struct {
 
 var validJobNameRe = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9._-]*$`)
 
-// deriveJobNames maps a user-supplied name (ChargeInvoice, charge-invoice,
-// charge_invoice, billing.charge) to file, func, and job identifiers,
-// mirroring make:command's flexible input handling.
+// deriveJobNames maps a name in any style to file, func, and job identifiers.
 func deriveJobNames(raw string) (jobNames, error) {
 	raw = strings.TrimSpace(raw)
 	if !validJobNameRe.MatchString(raw) {
@@ -99,7 +93,6 @@ func deriveJobNames(raw string) (jobNames, error) {
 	}, nil
 }
 
-// kebab lowercases one dot-segment, splitting Studly humps.
 func kebab(s string) string {
 	var words []string
 	for _, part := range strings.FieldsFunc(s, func(r rune) bool { return r == '-' || r == '_' || r == ' ' }) {
@@ -112,7 +105,6 @@ func kebab(s string) string {
 	return strings.Join(lower, "-")
 }
 
-// splitCamel splits "SendEmails" into ["Send" "Emails"].
 func splitCamel(s string) []string {
 	var words []string
 	start := 0
@@ -126,8 +118,6 @@ func splitCamel(s string) []string {
 	return append(words, s[start:])
 }
 
-// capitalize uppercases the first letter and lowercases the rest, turning a
-// word into its StudlyCase segment.
 func capitalize(s string) string {
 	if s == "" {
 		return s
@@ -140,6 +130,7 @@ var jobTemplate = template.Must(template.New("job").Parse(`package jobs
 import (
 	"context"
 	"encoding/json"
+	"errors"
 {{if .NeedsTime}}	"time"
 {{end}}
 	"{{.Module}}/pkg/queue"
@@ -163,12 +154,12 @@ func {{.Func}}(ctx context.Context, job queue.Job) error {
 	if err := json.Unmarshal({{if .Schedule}}scheduler.Data(job.Payload){{else}}job.Payload{{end}}, &payload); err != nil {
 		return err
 	}
-	// TODO: your logic here.
-	return nil
+	// TODO: your logic here. Fails until implemented so the job is
+	// retried/buried instead of silently acknowledged as done.
+	return errors.New("job {{.Name}} is not implemented")
 }
 `))
 
-// renderJob renders the stub source, gofmt-formatted.
 func renderJob(n jobNames) ([]byte, error) {
 	var sb strings.Builder
 	if err := jobTemplate.Execute(&sb, n); err != nil {
@@ -177,8 +168,7 @@ func renderJob(n jobNames) ([]byte, error) {
 	return format.Source([]byte(sb.String()))
 }
 
-// parseSchedule maps the --schedule flag to a scheduler builder chain, e.g.
-// "daily@02:00" to `.DailyAt(2, 0)`, validating shape and ranges.
+// parseSchedule maps the --schedule flag to a scheduler builder chain.
 func parseSchedule(flag string) (string, error) {
 	if strings.HasPrefix(flag, "cron:") {
 		expr := strings.TrimSpace(strings.TrimPrefix(flag, "cron:"))
@@ -219,8 +209,7 @@ func parseSchedule(flag string) (string, error) {
 	}
 }
 
-// modulePath reads the module path from go.mod in the working directory,
-// so generated import paths survive a cloner renaming the module.
+// modulePath reads the module path from go.mod (run from repo root).
 func modulePath() (string, error) {
 	data, err := os.ReadFile("go.mod")
 	if err != nil {
@@ -236,9 +225,7 @@ func modulePath() (string, error) {
 	return "", fmt.Errorf("no module line in go.mod")
 }
 
-// generateJob validates the name, renders the stub, and writes it into
-// --dir. Same-package files need no import sync: package jobs compiles the
-// new file (and its init()) automatically. Dry-run prints instead.
+// generateJob validates the name, renders the stub, and writes it into --dir.
 func generateJob(cmd *cobra.Command, dir, raw, sched string, force, dryRun bool) error {
 	n, err := deriveJobNames(raw)
 	if err != nil {

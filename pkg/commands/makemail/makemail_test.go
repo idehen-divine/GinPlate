@@ -56,7 +56,6 @@ func TestMakeMail(t *testing.T) {
 		s := string(src)
 		for _, want := range []string{
 			"package ordershipped",
-			`"example.com/demo/internal/mail"`,
 			`"example.com/demo/pkg/mail"`,
 			"type OrderShipped struct",
 			"func (m OrderShipped) Build() (pkgmail.Message, error)",

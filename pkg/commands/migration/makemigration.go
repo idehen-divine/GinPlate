@@ -13,19 +13,9 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// NewMakeMigrationCmd builds the `make:migration` generator:
-// `ginplate make:migration CreatePostsTable` writes versioned
-// goose files for both dialects, e.g.
-// migrations/app/mysql/20261006194637_create_posts_table.sql and
-// migrations/app/pgsql/20261006194637_create_posts_table.sql.
-//
-// Versions are UTC timestamps (YYYYMMDDHHMMSS, goose-compatible: one leading
-// integer — goose reads only up to the first underscore, so timestamp parts
-// must not be underscore-separated), so files always order by creation time — one table per
-// file, pass --create for a CREATE TABLE stub, otherwise blank Up/Down.
-//
-// With --create <table> the files contain a CREATE TABLE stub for that
-// table; otherwise the Up/Down bodies are blank for your DDL.
+// NewMakeMigrationCmd builds the `make:migration` generator: writes versioned
+// goose files for both dialects (UTC timestamps, so files order by creation).
+// Pass --create for a CREATE TABLE stub, otherwise blank Up/Down.
 func NewMakeMigrationCmd() *cobra.Command {
 	var root, domain, create string
 	var dryRun bool
@@ -88,8 +78,7 @@ type migrationData struct {
 	Table string
 }
 
-// migrationFileBase derives the snake_case base (no extension) from a name
-// like CreatePostsTable, create-posts-table, or create_posts_table.
+// migrationFileBase derives the snake_case base from a name in any style.
 func migrationFileBase(raw string) (string, error) {
 	raw = strings.TrimSpace(raw)
 	if !migrationNameRe.MatchString(raw) {
@@ -106,7 +95,6 @@ func migrationFileBase(raw string) (string, error) {
 	return strings.Join(lower, "_"), nil
 }
 
-// splitMigrationWords splits "CreatePostsTable" into ["Create" "Posts" "Table"].
 func splitMigrationWords(s string) []string {
 	var words []string
 	start := 0
@@ -120,12 +108,8 @@ func splitMigrationWords(s string) []string {
 	return append(words, s[start:])
 }
 
-// nextMigrationVersion returns a UTC timestamp version (YYYYMMDDHHMMSS)
-// guaranteed to be greater than every migration already on disk, so files
-// always order by creation time. If the clock yields something not newer
-// (two generations within one second, skew), it falls back to max+1.
-// Existing files may use any leading-integer prefix (old sequential or new
-// timestamps) — only the numeric value matters, like goose itself.
+// nextMigrationVersion returns a UTC timestamp version greater than every
+// migration on disk (falls back to max+1 on clock skew).
 func nextMigrationVersion(root, domain string, now time.Time) (int64, error) {
 	var max int64
 	for _, dialect := range []string{"mysql", "pgsql"} {
@@ -164,7 +148,6 @@ func nextMigrationVersion(root, domain string, now time.Time) (int64, error) {
 	return candidate, nil
 }
 
-// renderMigration executes a dialect template with the table name.
 func renderMigration(tmpl *template.Template, table string) (string, error) {
 	var sb strings.Builder
 	if err := tmpl.Execute(&sb, migrationData{Table: table}); err != nil {
@@ -173,8 +156,7 @@ func renderMigration(tmpl *template.Template, table string) (string, error) {
 	return sb.String(), nil
 }
 
-// generateMigration validates the name, picks the next timestamp version,
-// renders both dialect files, and writes them (or prints them on dry-run).
+// generateMigration validates the name and writes both dialect files.
 func generateMigration(cmd *cobra.Command, root, domain, raw, create string, dryRun bool) error {
 	base, err := migrationFileBase(raw)
 	if err != nil {

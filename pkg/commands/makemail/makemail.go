@@ -12,14 +12,8 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// NewMakeMailCmd builds the `make:mail` generator:
-// `ginplate make:mail OrderShipped` writes
-// internal/mail/order_shipped/order_shipped.go beside
-// internal/mail/order_shipped/order_shipped.html — the mailable struct next
-// to its template, mirroring the bundled welcome and password_reset mails.
-// Handlers then send it in one line:
-//
-//	appmail.Send(ctx, sender, user.Email, ordershipped.OrderShipped{...})
+// NewMakeMailCmd builds the `make:mail` generator: scaffolds a mailable
+// struct beside its HTML template.
 func NewMakeMailCmd() *cobra.Command {
 	var dir string
 	var force, dryRun bool
@@ -43,7 +37,6 @@ appmail.Send / appmail.Queue with no further wiring.`,
 	return cmd
 }
 
-// mailNames holds the derived identifiers for a generated mailable.
 type mailNames struct {
 	Struct   string // e.g. OrderShipped (mailable struct)
 	Dir      string // e.g. order_shipped (subdirectory under --dir)
@@ -55,8 +48,7 @@ type mailNames struct {
 
 var validNameRe = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]*$`)
 
-// deriveNames maps a user-supplied name (OrderShipped, order-shipped,
-// order_shipped) to struct, file, template, and package identifiers.
+// deriveNames maps a name in any style to struct, file, and template identifiers.
 func deriveNames(raw string) (mailNames, error) {
 	raw = strings.TrimSpace(raw)
 	if !validNameRe.MatchString(raw) {
@@ -84,7 +76,6 @@ func deriveNames(raw string) (mailNames, error) {
 	}, nil
 }
 
-// splitCamel splits "OrderShipped" into ["Order" "Shipped"].
 func splitCamel(s string) []string {
 	var words []string
 	start := 0
@@ -98,8 +89,6 @@ func splitCamel(s string) []string {
 	return append(words, s[start:])
 }
 
-// capitalize uppercases the first letter and lowercases the rest, turning a
-// word into its StudlyCase segment.
 func capitalize(s string) string {
 	if s == "" {
 		return s
@@ -114,7 +103,6 @@ package {{.Pkg}}
 import (
 	"embed"
 
-	appmail "{{.Module}}/internal/mail"
 	pkgmail "{{.Module}}/pkg/mail"
 )
 
@@ -125,6 +113,9 @@ var templateFS embed.FS
 // fields your template needs, then send it from any handler:
 //
 //	appmail.Send(ctx, sender, m.Email, {{.Struct}}{...})
+//
+// To preview it via POST /api/v1/mail/preview/{{.Dir}} (debug only), add one
+// entry to the mailables map in internal/mail/mail.go.
 type {{.Struct}} struct {
 	Name  string
 	Email string
@@ -132,7 +123,7 @@ type {{.Struct}} struct {
 
 // Build renders {{.Template}} into a ready-to-send Message.
 func (m {{.Struct}}) Build() (pkgmail.Message, error) {
-	html, err := appmail.RenderFS(templateFS, "{{.Dir}}", m)
+	html, err := pkgmail.RenderFS(templateFS, "{{.Dir}}", m)
 	if err != nil {
 		return pkgmail.Message{}, err
 	}
@@ -157,7 +148,6 @@ var htmlTemplate = template.Must(template.New("html").Parse(`<!doctype html>
 </html>
 `))
 
-// renderMailable renders the stub source, gofmt-formatted.
 func renderMailable(n mailNames) ([]byte, error) {
 	var sb strings.Builder
 	if err := mailableTemplate.Execute(&sb, n); err != nil {
@@ -166,7 +156,6 @@ func renderMailable(n mailNames) ([]byte, error) {
 	return format.Source([]byte(sb.String()))
 }
 
-// renderHTML renders the stub template (HTML is written as-is).
 func renderHTML(n mailNames) ([]byte, error) {
 	var sb strings.Builder
 	if err := htmlTemplate.Execute(&sb, n); err != nil {
@@ -175,8 +164,7 @@ func renderHTML(n mailNames) ([]byte, error) {
 	return []byte(sb.String()), nil
 }
 
-// modulePath reads the module path from go.mod in the working directory,
-// so generated import paths survive a cloner renaming the module.
+// modulePath reads the module path from go.mod (run from repo root).
 func modulePath() (string, error) {
 	data, err := os.ReadFile("go.mod")
 	if err != nil {
@@ -192,8 +180,7 @@ func modulePath() (string, error) {
 	return "", fmt.Errorf("no module line in go.mod")
 }
 
-// generateMail validates the name, renders the stub pair, and writes both
-// files into their own directory. Dry-run prints instead of writing.
+// generateMail validates the name and writes the stub pair into its directory.
 func generateMail(cmd *cobra.Command, dir, raw string, force, dryRun bool) error {
 	n, err := deriveNames(raw)
 	if err != nil {
