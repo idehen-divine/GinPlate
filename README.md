@@ -128,6 +128,9 @@ Important defaults:
 | `QUEUE_CONNECTION` | `sync` | `sync`, `database`, or `redis` |
 | `MAIL_MAILER` | `log` | `log`, `smtp`, or `ses` |
 | `FILESYSTEM_DISK` | `local` | `local`, `public`, or `s3` |
+| `ENABLE_METRICS` | `false` | Exposes `/metrics` publicly |
+| `HTTP_MAX_BODY_BYTES` | `1048576` | Max request body bytes (`0` disables) |
+| `DB_MAX_OPEN_CONNS` | `20` | Pool size shared by every replica |
 
 `APP_KEY` is required for startup. Generate it with:
 
@@ -149,6 +152,9 @@ ginplate make:migration CreatePostsTable --create posts
 ginplate make:command SendReport
 ginplate make:job Billing.Charge --schedule=daily@02:00
 ginplate make:mail OrderShipped
+ginplate make:middleware AuditLog
+ginplate make:middleware RequestID --global
+ginplate make:exception PaymentRequired --status 402
 ginplate make:notification OrderShipped
 ginplate queue:work
 ginplate queue:failed
@@ -156,6 +162,7 @@ ginplate queue:retry <id|all>
 ginplate queue:forget <id>
 ginplate queue:flush --force
 ginplate schedule:work
+ginplate route:list
 ginplate key:generate
 ginplate mail:test --to user@example.com
 ginplate down
@@ -210,11 +217,14 @@ call one service method, and render with `web.Success` or `web.Render`.
 ```text
 cmd/ginplate                   Application binary entrypoint
 internal/commands              Custom command registry
+internal/exceptions            Domain error types + mappings
 internal/jobs                  Queue job registry and scheduled jobs
 internal/mail                  Application mailables
+internal/middleware            App middleware (auth, roles, request-id)
 internal/modules/auth          Authentication workflow
 internal/modules/users         User resource module
 internal/modules/notifications Notification inbox module
+internal/modules/register.go   Module root registry (blank imports)
 internal/notifications         Application notifications
 migrations/app                 MySQL and PostgreSQL migrations
 pkg/app                        Runtime wiring for API, workers, scheduler
@@ -231,7 +241,7 @@ pkg/scheduler                  Scheduled entries and locks
 pkg/session                    Session stores
 pkg/storage                    Storage disks
 pkg/validator                  Validation formatting
-pkg/web                        HTTP responses, errors, auth, request helpers
+pkg/web                        HTTP responses, errors, registries, request helpers
 ```
 
 ## Module Pattern
@@ -244,10 +254,14 @@ dto.go          Request DTOs
 repository.go   Persistence boundary
 service.go      Business rules and classified errors
 handler.go      HTTP binding and rendering
-routes.go       Route registration and middleware
+routes.go       Route self-registration (init) + mounting and middleware
 resource.go     Response shaping
-service_test.go Focused service coverage
+<name>_test.go  Single test file: all module coverage with subtests
 ```
+
+New modules self-register via `init()` in `routes.go` plus one blank-import
+line in `internal/modules/register.go`; `route:list` stays in sync
+automatically.
 
 `internal/modules/users` is the reference implementation.
 
@@ -321,6 +335,11 @@ ginplate make:mail OrderShipped
 
 Mailables live in `internal/mail/<name>` with the Go type beside its template.
 
+Password reset ships as helpers only (`MintResetToken`/`HashResetToken`,
+the `password_reset` mailable, `SendPasswordReset`): no forgot/reset
+endpoints are wired. A complete flow still needs token persistence with
+expiry, single-use enforcement, invalidation on success, and rate limiting.
+
 ## Notifications
 
 Notifications support database and mail channels out of the box.
@@ -338,6 +357,32 @@ Use `FILESYSTEM_DISK` to select `local`, `public`, or `s3`.
 
 The public disk serves files from the configured public URL path. Local private
 files are not exposed over HTTP, and path traversal attempts are rejected.
+
+Keep the directory contract: only public assets under
+`storage/app/public/` — never sessions, the maintenance marker, logs, or
+uploads. Boot refuses a layout that places those under the public root:
+
+```text
+storage/app/public/     public assets only (served over HTTP)
+storage/app/private/    private files (never served)
+storage/framework/      sessions and maintenance state
+storage/logs/           logs
+```
+
+## Production Notes
+
+- Behind a reverse proxy, client IPs come from the proxy: the app trusts no
+  proxy headers by default (`gin.New()`), so IP-based limits see the proxy
+  address unless the proxy is accounted for. Terminate TLS at the proxy and
+  keep `APP_URL` https.
+- `/livez` and `/readyz` stay public for orchestrator probes. Set
+  `ENABLE_METRICS=false` when scrapes run on a private network or sidecar,
+  and restrict `/health` similarly if queue-depth data is sensitive.
+- Treat `staging` like `production` (TLS, CORS, mail, secrets): staging
+  often holds real data but skips the production guardrails.
+- Size `DB_MAX_OPEN_CONNS` for replica count, not one process: every
+  `serve`, `queue:work`, and `schedule:work` replica opens its own pool
+  against the same database.
 
 ## Development
 

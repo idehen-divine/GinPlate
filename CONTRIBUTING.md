@@ -63,7 +63,7 @@ feat(auth): add password reset expiry
 - Keep business rules in services.
 - Keep persistence in repositories.
 - Return classified `web.AppError` values from services when possible.
-- Use typed roles from `pkg/web` instead of string literals.
+- Use typed roles from `internal/middleware` instead of string literals.
 - Prefer existing package patterns over new abstractions.
 - Add tests near the behavior you change.
 
@@ -79,8 +79,14 @@ service.go
 handler.go
 routes.go
 resource.go
-service_test.go
+<name>_test.go
 ```
+
+`routes.go` self-registers via `init()` plus one blank-import line in
+`internal/modules/register.go`; tests live in a single `<name>_test.go`
+file per module. See `docs/backend-rules.md` for the full conventions.
+See `docs/naming-conventions.md` for identifier, dependency, interface, and
+test-double naming guidance.
 
 Process modules, such as authentication, can skip `model.go` and
 `repository.go` when they coordinate existing data instead of owning a table.
@@ -106,6 +112,8 @@ Use the generators for common project shapes:
 go run ./cmd/ginplate make:command SendReport
 go run ./cmd/ginplate make:job Billing.Charge
 go run ./cmd/ginplate make:mail OrderShipped
+go run ./cmd/ginplate make:middleware AuditLog
+go run ./cmd/ginplate make:exception PaymentRequired --status 402
 go run ./cmd/ginplate make:notification OrderShipped
 ```
 
@@ -145,3 +153,13 @@ loopback networking.
 Do not open public issues for sensitive vulnerabilities. If you discover a
 security issue, contact the maintainer privately so it can be fixed before
 details are published.
+
+## Dependency Policy
+
+- Direct dependencies are reviewed before upgrading; check release notes
+  for security-sensitive libraries (TLS, crypto, HTTP, SQL drivers).
+- Run `go run golang.org/x/vuln/cmd/govulncheck@latest ./...` (also `make vuln`)
+  before merging dependency changes — CI enforces a clean scan.
+- Prefer the latest patched Go release on the current minor line; update
+  `go.mod`, the CI `go-version`, and the Dockerfile base images together.
+- Production images stay digest-pinned; update tag and digest together.
