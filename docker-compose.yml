@@ -26,6 +26,7 @@ services:
       REDIS_PORT: "6379"
       MAIL_HOST: mailhog
       MAIL_PORT: "1025"
+      QUEUE_CONNECTION: redis
       APP_URL: http://localhost:8080
       CORS_ALLOWED_ORIGINS: http://localhost:8080
     depends_on:
@@ -51,6 +52,7 @@ services:
       DB_HOST: mysql
       DB_PASSWORD: ${MYSQL_PASSWORD:?set MYSQL_PASSWORD (no default — see header)}
       REDIS_HOST: redis
+      QUEUE_CONNECTION: redis
     depends_on:
       mysql:
         condition: service_healthy
@@ -69,6 +71,7 @@ services:
       DB_HOST: mysql
       DB_PASSWORD: ${MYSQL_PASSWORD:?set MYSQL_PASSWORD (no default — see header)}
       REDIS_HOST: redis
+      QUEUE_CONNECTION: redis
     depends_on:
       mysql:
         condition: service_healthy
@@ -79,7 +82,7 @@ services:
     restart: unless-stopped
 
   mysql:
-    image: mysql:8.4
+    image: mysql:8.4@sha256:80f4933e3835f9dc4d35a28ec500d7986cb4414e6c6821c5461239cb7beb8995
     environment:
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?set MYSQL_ROOT_PASSWORD (no default — see header)}
       MYSQL_DATABASE: ginplate
@@ -96,14 +99,16 @@ services:
       retries: 10
 
   redis:
-    image: redis:7-alpine
+    # No authentication by design: local development only (see file header).
+    # Shared environments need REDIS_PASSWORD/TLS plus a non-default ACL user.
+    image: redis:7-alpine@sha256:ca0acbb137c1dc3339c8b147a58fd6f42775d4599327b50e7b116c23de501af2
     ports:
       - "127.0.0.1:6379:6379"
     volumes:
       - redis-data:/data
 
   mailhog:
-    image: mailhog/mailhog:v1.0.1
+    image: mailhog/mailhog:v1.0.1@sha256:4de68494cd0dbcbc141beb755eedce4d328ab10b2d1061d74c2489e0af5f28a9
     ports:
       - "127.0.0.1:1025:1025"
       - "127.0.0.1:8025:8025"

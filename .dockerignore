@@ -4,7 +4,9 @@ bin/
 storage/logs/
 coverage.out
 coverage.html
-docs/
+docs/docs.go
+docs/swagger.json
+docs/swagger.yaml
 .idea/
 .vscode/
 *.log
