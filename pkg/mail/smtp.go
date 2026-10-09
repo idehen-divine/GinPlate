@@ -12,8 +12,8 @@ import (
 	"github.com/idehen-divine/GinPlate/pkg/config"
 )
 
-// smtpMailer delivers via SMTP. Encryption is "" (plain, with STARTTLS
-// when advertised), "tls" (STARTTLS required), or "ssl" (implicit TLS).
+// smtpMailer encryption: "" (STARTTLS when advertised), "tls" (required),
+// or "ssl" (implicit TLS).
 type smtpMailer struct {
 	host       string
 	port       int
@@ -25,7 +25,6 @@ type smtpMailer struct {
 	fromName   string
 }
 
-// NewSMTP builds the SMTP driver from MAIL_* config. Empty host fails fast.
 func NewSMTP(cfg config.Mail) (Sender, error) {
 	if strings.TrimSpace(cfg.Host) == "" {
 		return nil, fmt.Errorf("mail: smtp needs MAIL_HOST")
@@ -46,7 +45,6 @@ func NewSMTP(cfg config.Mail) (Sender, error) {
 	}, nil
 }
 
-// Send renders msg to MIME and delivers it through one SMTP session.
 func (m *smtpMailer) Send(ctx context.Context, msg Message) error {
 	raw, err := buildRaw(m.fromAddr, m.fromName, msg)
 	if err != nil {
@@ -88,15 +86,17 @@ func (m *smtpMailer) Send(ctx context.Context, msg Message) error {
 	if err := client.Hello("localhost"); err != nil {
 		return fmt.Errorf("mail: smtp hello: %w", err)
 	}
+	// Fail closed on TLS: an advertised-but-failing STARTTLS aborts delivery
+	// (a downgrade attacker must not silently win), and authenticated SMTP
+	// without TLS is refused. Plaintext stays available only for
+	// unauthenticated local development servers.
 	if ok, _ := client.Extension("STARTTLS"); ok {
-		tlsCfg := &tls.Config{ServerName: m.host} //nolint:gosec // opportunistic STARTTLS with host verification.
+		tlsCfg := &tls.Config{ServerName: m.host} //nolint:gosec // STARTTLS with host verification.
 		if err := client.StartTLS(tlsCfg); err != nil {
-			if m.encryption == "tls" {
-				return fmt.Errorf("mail: smtp starttls: %w", err)
-			}
+			return fmt.Errorf("mail: smtp starttls: %w", err)
 		}
-	} else if m.encryption == "tls" {
-		return fmt.Errorf("mail: smtp server does not advertise STARTTLS")
+	} else if m.username != "" || m.encryption == "tls" {
+		return fmt.Errorf("mail: refusing SMTP without TLS")
 	}
 	if m.username != "" {
 		auth := smtp.PlainAuth("", m.username, m.password, m.host)

@@ -26,15 +26,18 @@ type SenderFunc func(ctx context.Context, msg Message) error
 
 func (f SenderFunc) Send(ctx context.Context, msg Message) error { return f(ctx, msg) }
 
-// fakeSMTP is a minimal SMTP server for tests: greeting, EHLO (no
-// extensions), MAIL/RCPT/DATA/QUIT. It captures the envelope and raw body.
+// fakeSMTP is a minimal SMTP server for tests: greeting, EHLO, MAIL/RCPT/
+// DATA/QUIT. It captures the envelope and raw body. With starttlsFail it
+// advertises STARTTLS and then fails the negotiation, proving clients fail
+// closed instead of downgrading to plaintext.
 type fakeSMTP struct {
-	t        *testing.T
-	listener net.Listener
-	from     string
-	rcpts    []string
-	data     string
-	done     chan struct{}
+	t            *testing.T
+	listener     net.Listener
+	from         string
+	rcpts        []string
+	data         string
+	done         chan struct{}
+	starttlsFail bool
 }
 
 func newFakeSMTP(t *testing.T) *fakeSMTP {
@@ -79,8 +82,20 @@ func (s *fakeSMTP) serve() {
 		upper := strings.ToUpper(line)
 		switch {
 		case strings.HasPrefix(upper, "EHLO") || strings.HasPrefix(upper, "HELO"):
-			write("250-fake")
-			write("250 HELP")
+			if s.starttlsFail {
+				write("250-fake")
+				write("250-STARTTLS")
+				write("250 HELP")
+			} else {
+				write("250-fake")
+				write("250 HELP")
+			}
+		case strings.HasPrefix(upper, "STARTTLS"):
+			if s.starttlsFail {
+				write("454 TLS not available")
+			} else {
+				write("502 unimplemented")
+			}
 		case strings.HasPrefix(upper, "MAIL FROM:"):
 			s.from = line[len("MAIL FROM:"):]
 			write("250 ok")
@@ -275,6 +290,55 @@ func TestMail(t *testing.T) {
 		}
 		if !strings.Contains(srv.data, "hi there") {
 			t.Fatalf("body missing text part:\n%s", srv.data)
+		}
+	})
+
+	t.Run("smtp/starttls-failure-aborts", func(t *testing.T) {
+		srv := newFakeSMTP(t)
+		srv.starttlsFail = true
+		host, port := srv.addr()
+		sender, err := NewSMTP(config.Mail{
+			Host:       host,
+			Port:       port,
+			From:       config.MailFrom{Address: "from@example.com"},
+			TimeoutSec: 5,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		err = sender.Send(ctx, validMessage())
+		if err == nil || !strings.Contains(err.Error(), "starttls") {
+			t.Fatalf("STARTTLS failure must abort: got %v", err)
+		}
+		if srv.from != "" || len(srv.rcpts) != 0 {
+			t.Fatalf("nothing must be transmitted after failed STARTTLS: from=%q rcpts=%v", srv.from, srv.rcpts)
+		}
+	})
+
+	t.Run("smtp/refuses-plaintext-auth", func(t *testing.T) {
+		srv := newFakeSMTP(t)
+		host, port := srv.addr()
+		sender, err := NewSMTP(config.Mail{
+			Host:       host,
+			Port:       port,
+			Username:   "user",
+			Password:   "secret",
+			From:       config.MailFrom{Address: "from@example.com"},
+			TimeoutSec: 5,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		err = sender.Send(ctx, validMessage())
+		if err == nil || !strings.Contains(err.Error(), "without TLS") {
+			t.Fatalf("plaintext auth must be refused: got %v", err)
+		}
+		if srv.from != "" {
+			t.Fatalf("credentials must not be transmitted: from=%q", srv.from)
 		}
 	})
 }
