@@ -10,13 +10,11 @@ import (
 	"gorm.io/gorm"
 )
 
-// Channel names for the bundled backends.
 const (
 	ChannelDatabase = "database"
 	ChannelMail     = "mail"
 )
 
-// Record is one stored notification row.
 type Record struct {
 	ID             uuid.UUID  `gorm:"type:char(36);primaryKey" json:"id"`
 	NotifiableType string     `gorm:"not null;index" json:"-"`
@@ -27,10 +25,8 @@ type Record struct {
 	CreatedAt      time.Time  `json:"created_at"`
 }
 
-// TableName pins the GORM table for Record.
 func (Record) TableName() string { return "notifications" }
 
-// BeforeCreate assigns a UUID primary key when the caller didn't set one.
 func (r *Record) BeforeCreate(_ *gorm.DB) error {
 	if r.ID == uuid.Nil {
 		r.ID = uuid.New()
@@ -38,7 +34,6 @@ func (r *Record) BeforeCreate(_ *gorm.DB) error {
 	return nil
 }
 
-// DecodedData unmarshals the stored JSON payload.
 func (r Record) DecodedData() map[string]any {
 	var out map[string]any
 	if err := json.Unmarshal([]byte(r.Data), &out); err != nil {
@@ -47,8 +42,6 @@ func (r Record) DecodedData() map[string]any {
 	return out
 }
 
-// Store persists and reads notification rows. GormStore is the live
-// implementation; tests and callers inject fakes behind this seam.
 type Store interface {
 	Create(ctx context.Context, to Notifiable, notifType string, data map[string]any) (*Record, error)
 	List(ctx context.Context, to Notifiable, limit, offset int) (rows []Record, total int64, err error)
@@ -57,19 +50,15 @@ type Store interface {
 	UnreadCount(ctx context.Context, to Notifiable) (int64, error)
 }
 
-// GormStore is the GORM-backed Store.
 type GormStore struct{ db *gorm.DB }
 
-// NewStore opens the store around db.
 func NewStore(db *gorm.DB) *GormStore { return &GormStore{db: db} }
 
-// scope narrows queries to one notifiable's rows, so callers can never
-// touch another audience's notifications.
+// scope narrows queries to one notifiable's rows.
 func scope(db *gorm.DB, to Notifiable) *gorm.DB {
 	return db.Where("notifiable_type = ? AND notifiable_id = ?", to.Type, to.ID)
 }
 
-// Create stores one notification row.
 func (s *GormStore) Create(ctx context.Context, to Notifiable, notifType string, data map[string]any) (*Record, error) {
 	raw, err := json.Marshal(data)
 	if err != nil {
@@ -87,7 +76,6 @@ func (s *GormStore) Create(ctx context.Context, to Notifiable, notifType string,
 	return rec, nil
 }
 
-// List returns newest-first rows plus the total for paging.
 func (s *GormStore) List(ctx context.Context, to Notifiable, limit, offset int) ([]Record, int64, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 25
@@ -107,8 +95,7 @@ func (s *GormStore) List(ctx context.Context, to Notifiable, limit, offset int) 
 	return rows, total, nil
 }
 
-// MarkRead stamps one row read. A row belonging to someone else (or missing)
-// reports gorm.ErrRecordNotFound, which handlers render as 404.
+// MarkRead stamps one row read (foreign/missing rows report not-found).
 func (s *GormStore) MarkRead(ctx context.Context, to Notifiable, id uuid.UUID) error {
 	res := scope(s.db.WithContext(ctx).Model(&Record{}), to).
 		Where("id = ? AND read_at IS NULL", id.String()).Update("read_at", time.Now())
@@ -121,13 +108,11 @@ func (s *GormStore) MarkRead(ctx context.Context, to Notifiable, id uuid.UUID) e
 	return nil
 }
 
-// MarkAllRead stamps every unread row for the notifiable.
 func (s *GormStore) MarkAllRead(ctx context.Context, to Notifiable) error {
 	return scope(s.db.WithContext(ctx).Model(&Record{}), to).
 		Where("read_at IS NULL").Update("read_at", time.Now()).Error
 }
 
-// UnreadCount counts unread rows for the notifiable.
 func (s *GormStore) UnreadCount(ctx context.Context, to Notifiable) (int64, error) {
 	var n int64
 	if err := scope(s.db.WithContext(ctx).Model(&Record{}), to).
@@ -137,13 +122,10 @@ func (s *GormStore) UnreadCount(ctx context.Context, to Notifiable) (int64, erro
 	return n, nil
 }
 
-// DatabaseChannel persists the notification via the store in deps.
 type DatabaseChannel struct{}
 
-// Name matches Via entries for stored delivery.
 func (DatabaseChannel) Name() string { return ChannelDatabase }
 
-// Send renders ToDatabase and stores the row.
 func (DatabaseChannel) Send(ctx context.Context, deps Deps, to Notifiable, n Notification) error {
 	store, err := deps.storeFor()
 	if err != nil {

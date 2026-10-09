@@ -5,19 +5,15 @@ import (
 	"log/slog"
 )
 
-// logMailer is the dev/test driver: it validates and logs instead of
-// delivering, so a bare .env still boots and tests stay hermetic.
 type logMailer struct {
 	fromAddr string
 	fromName string
 }
 
-// NewLog returns the log driver with the configured default sender.
 func NewLog(fromAddr, fromName string) Sender {
 	return &logMailer{fromAddr: fromAddr, fromName: fromName}
 }
 
-// Send validates msg and logs its summary (body excluded at info level).
 func (m *logMailer) Send(_ context.Context, msg Message) error {
 	if err := Validate(msg); err != nil {
 		return err

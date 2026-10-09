@@ -11,9 +11,7 @@ import (
 	"time"
 )
 
-// buildRaw renders msg as an RFC 5322 MIME message for the SMTP DATA
-// command and the SESv2 raw send. To/Cc appear in headers; Bcc travels in
-// the envelope only and is omitted here. Tags ride as X-Tag-* headers.
+// buildRaw renders msg as MIME (Bcc travels in the envelope only).
 func buildRaw(fromAddr, fromName string, msg Message) ([]byte, error) {
 	if err := Validate(msg); err != nil {
 		return nil, err
@@ -92,7 +90,6 @@ func buildRaw(fromAddr, fromName string, msg Message) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// writeAltPart writes the text and HTML bodies inside an alternative part.
 func writeAltPart(buf *bytes.Buffer, alt, text, html string) {
 	if strings.TrimSpace(text) != "" {
 		fmt.Fprintf(buf, "--%s\r\nContent-Type: text/plain; charset=UTF-8\r\nContent-Transfer-Encoding: quoted-printable\r\n\r\n%s\r\n", alt, text)
@@ -102,7 +99,6 @@ func writeAltPart(buf *bytes.Buffer, alt, text, html string) {
 	}
 }
 
-// writeAttachment appends one file part to a mixed boundary.
 func writeAttachment(buf *bytes.Buffer, mixed string, f Attachment) {
 	ctype := f.ContentType
 	if strings.TrimSpace(ctype) == "" {
@@ -124,7 +120,6 @@ func writeAttachment(buf *bytes.Buffer, mixed string, f Attachment) {
 	buf.WriteString(enc + "\r\n")
 }
 
-// formatAddr renders a display name + address pair, Q-encoding the name.
 func formatAddr(name, addr string) string {
 	addr = strings.TrimSpace(addr)
 	if strings.TrimSpace(name) == "" {
@@ -133,8 +128,6 @@ func formatAddr(name, addr string) string {
 	return (&mail.Address{Name: name, Address: addr}).String()
 }
 
-// boundary mints a MIME boundary. Crypto-rand failure falls back to a
-// timestamped constant rather than failing the whole send.
 func boundary() string {
 	var b [12]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -143,7 +136,6 @@ func boundary() string {
 	return fmt.Sprintf("ginplate-%x", b)
 }
 
-// envelopeRecipients flattens To+Cc+Bcc for the SMTP envelope.
 func envelopeRecipients(msg Message) []string {
 	return append(append(append([]string{}, msg.To...), msg.Cc...), msg.Bcc...)
 }

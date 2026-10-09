@@ -1,14 +1,5 @@
-// Package mail delivers outgoing email behind a small interface so the
-// driver can change without touching callers. Three drivers ship:
-//
-//	log  - writes to the logs, no delivery (dev/test default).
-//	smtp - real delivery via MAIL_HOST/PORT/USERNAME/PASSWORD/ENCRYPTION.
-//	ses  - AWS SESv2 raw send, reusing the standard AWS_* credential chain.
-//
-// Messages support To/Cc/Bcc, From/ReplyTo overrides, Text+HTML bodies,
-// attachments (regular + inline), custom headers, and tags/metadata.
-// Sending is sync via Send; Queue pushes a "mail.send" job onto the
-// configured queue backend (sync runs inline, like every other job).
+// Package mail delivers outgoing email behind a driver interface
+// (log/smtp/ses). Send delivers inline; Queue pushes a "mail.send" job.
 package mail
 
 import (

@@ -10,13 +10,8 @@ import (
 	"github.com/idehen-divine/GinPlate/pkg/queue"
 )
 
-// JobName is the queue job for background delivery. The payload carries
-// pre-resolved channel data (not the notification struct), so workers
-// deliver with no notification-type registry.
 const JobName = "notification.send"
 
-// jobPayload is the resolved work: who, what kind, the database row data,
-// and the rendered mail when Via includes mail.
 type jobPayload struct {
 	To   Notifiable       `json:"to"`
 	Type string           `json:"type"`
@@ -24,9 +19,8 @@ type jobPayload struct {
 	Mail *pkgmail.Message `json:"mail,omitempty"`
 }
 
-// resolvePayload renders ToDatabase/ToMail once, at enqueue time, failing
-// fast on unknown channels so workers never bury for typos. Channel
-// lookups go through the notifier's read lock.
+// resolvePayload renders payloads once, at enqueue time (unknown channels
+// fail here, not in the worker).
 func (n *Notifier) resolvePayload(to Notifiable, notif Notification) (jobPayload, error) {
 	p := jobPayload{To: to, Type: notif.Type()}
 	for _, name := range notif.Via() {
@@ -56,16 +50,13 @@ func (n *Notifier) resolvePayload(to Notifiable, notif Notification) (jobPayload
 			}
 			p.Mail = &msg
 		default:
-			// Custom channels deliver inline only for now: queueing an
-			// unknown payload shape would silently drop content. Extend
-			// resolvePayload when the channel learns a serializable form.
+			// Custom channels are send-only until they learn a serializable form.
 			return jobPayload{}, fmt.Errorf("notify: channel %q is send-only (not queueable yet)", name)
 		}
 	}
 	return p, nil
 }
 
-// mustMarshal encodes the payload for the queue.
 func mustMarshal(p jobPayload) []byte {
 	raw, err := json.Marshal(p)
 	if err != nil {
@@ -74,7 +65,6 @@ func mustMarshal(p jobPayload) []byte {
 	return raw
 }
 
-// parsePayload decodes a "notification.send" job payload.
 func parsePayload(raw []byte) (jobPayload, error) {
 	var p jobPayload
 	if err := json.Unmarshal(raw, &p); err != nil {

@@ -14,18 +14,14 @@ import (
 	"github.com/idehen-divine/GinPlate/pkg/config"
 )
 
-// sesMailer delivers through AWS SESv2 as a raw message, so MIME building
-// (attachments, inline embeds) is shared with the SMTP driver. Credentials
-// follow the same chain as pkg/storage: explicit AWS_* keys when set,
-// SDK default chain (env, shared config, IAM role) otherwise.
 type sesMailer struct {
 	client   *sesv2.Client
 	fromAddr string
 	fromName string
 }
 
-// NewSES builds the SES driver. Region is required (SES is regional);
-// credentials fall back to the SDK default chain when AWS keys are empty.
+// NewSES builds the SES driver (region required; credentials fall back to
+// the SDK default chain).
 func NewSES(mailCfg config.Mail, awsCfg config.S3) (Sender, error) {
 	if strings.TrimSpace(awsCfg.Region) == "" {
 		return nil, fmt.Errorf("mail: ses needs AWS_DEFAULT_REGION")
@@ -54,13 +50,10 @@ func NewSES(mailCfg config.Mail, awsCfg config.S3) (Sender, error) {
 	}, nil
 }
 
-// newSESWithClient wires a client directly, so tests inject a stub without
-// touching AWS. Kept unexported: production always goes through NewSES.
 func newSESWithClient(client *sesv2.Client, fromAddr, fromName string) *sesMailer {
 	return &sesMailer{client: client, fromAddr: fromAddr, fromName: fromName}
 }
 
-// Send renders msg to MIME and submits it as SESv2 raw mail.
 func (m *sesMailer) Send(ctx context.Context, msg Message) error {
 	raw, err := buildRaw(m.fromAddr, m.fromName, msg)
 	if err != nil {
