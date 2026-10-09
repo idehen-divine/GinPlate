@@ -4,26 +4,20 @@ import (
 	"github.com/spf13/viper"
 )
 
-// Filesystem holds file storage settings: one default disk plus per-disk
-// roots. Only implemented drivers serve traffic; the rest fail fast.
+// Filesystem holds file storage settings.
 type Filesystem struct {
-	// Disk selects the default disk: "local" (private), "public"
-	// (URL-servable local files), or "s3".
-	Disk string `mapstructure:"FILESYSTEM_DISK"`
-	// Root is the local disk base directory.
-	Root string `mapstructure:"FILESYSTEM_ROOT"`
-	// PublicRoot is the public disk base directory, served under PublicURL.
+	// Disk selects the default disk: "local", "public", or "s3".
+	Disk       string `mapstructure:"FILESYSTEM_DISK"`
+	Root       string `mapstructure:"FILESYSTEM_ROOT"`
 	PublicRoot string `mapstructure:"FILESYSTEM_PUBLIC_ROOT"`
-	// PublicURL is the public disk base URL. Empty resolves to
-	// APP_URL + "/storage" at load.
+	// PublicURL is the public disk base URL (empty resolves to APP_URL + "/storage").
 	PublicURL string `mapstructure:"FILESYSTEM_PUBLIC_URL"`
 
 	S3 S3 `mapstructure:",squash"`
 }
 
-// S3 holds object-storage credentials for the s3 disk driver.
-// Values come from the standard AWS_* environment keys. Empty Key falls
-// back to the SDK default credential chain (env, shared config, IAM role).
+// S3 holds object-storage credentials (standard AWS_* keys; empty Key falls
+// back to the SDK default credential chain).
 type S3 struct {
 	Key       string `mapstructure:"AWS_ACCESS_KEY_ID"`
 	Secret    string `mapstructure:"AWS_SECRET_ACCESS_KEY"`

@@ -8,24 +8,17 @@ import (
 	"github.com/spf13/viper"
 )
 
-// Auth holds authentication settings. The JWT signing secret comes from
-// APP_KEY (Laravel convention): either a raw string or `base64:...` encoded.
-// Refresh tokens live a fixed 30 days (RefreshTTL); only the access TTL is
-// configurable via APP_TTL_MIN.
+// Auth holds authentication settings (secret comes from APP_KEY).
 type Auth struct {
 	JWT JWT `mapstructure:",squash"`
 }
 
-// JWT holds token settings. Secret is never used raw when it carries the
-// `base64:` prefix — call KeyBytes.
 type JWT struct {
 	Secret       string `mapstructure:"APP_KEY"`
 	AccessTTLMin int    `mapstructure:"APP_TTL_MIN"`
 }
 
-// KeyBytes resolves the signing key: strips an optional `base64:` prefix
-// and requires at least 32 bytes. Load calls this eagerly so a missing or
-// weak APP_KEY fails startup instead of minting weak tokens.
+// KeyBytes resolves the signing key (`base64:` prefix stripped, min 32 bytes).
 func (j JWT) KeyBytes() ([]byte, error) {
 	raw := strings.TrimSpace(j.Secret)
 	if raw == "" {

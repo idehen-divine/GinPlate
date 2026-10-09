@@ -10,17 +10,14 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// Locker is an expiring mutual-exclusion primitive. Acquire takes the lock
-// only when it is free (or expired) and reports the token identifying this
-// holder; Release drops it only when the token still matches, so a holder
-// whose TTL lapsed can never release the next holder's lock.
+// Locker is expiring mutual exclusion: Release drops only on token match,
+// so an expired holder can never release the next holder's lock.
 type Locker interface {
 	Acquire(ctx context.Context, key string, ttl time.Duration) (token string, held bool, err error)
 	Release(ctx context.Context, key, token string) error
 }
 
-// MemoryLocker guards a single scheduler process. Two schedule:work
-// replicas do not share it: fleet-wide exclusion needs RedisLocker.
+// MemoryLocker guards a single process (fleet-wide needs RedisLocker).
 type MemoryLocker struct {
 	mu    sync.Mutex
 	locks map[string]memLock
@@ -31,7 +28,6 @@ type memLock struct {
 	expires time.Time
 }
 
-// NewMemoryLocker returns an empty in-process locker.
 func NewMemoryLocker() *MemoryLocker { return &MemoryLocker{locks: map[string]memLock{}} }
 
 func (l *MemoryLocker) Acquire(_ context.Context, key string, ttl time.Duration) (string, bool, error) {
@@ -54,14 +50,11 @@ func (l *MemoryLocker) Release(_ context.Context, key, token string) error {
 	return nil
 }
 
-// RedisLocker shares exclusion across every scheduler replica behind one
-// Redis: acquire is SET NX EX (atomic), release is a compare-and-del Lua
-// script so only the token holder drops the lock.
+// RedisLocker shares exclusion across replicas (SET NX EX + Lua compare-del).
 type RedisLocker struct {
 	rdb *redis.Client
 }
 
-// NewRedisLocker returns a fleet-wide locker on rdb.
 func NewRedisLocker(rdb *redis.Client) *RedisLocker { return &RedisLocker{rdb: rdb} }
 
 func (l *RedisLocker) Acquire(ctx context.Context, key string, ttl time.Duration) (string, bool, error) {

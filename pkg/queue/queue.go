@@ -1,8 +1,5 @@
-// Package queue provides background jobs behind a selectable backend, so
-// the broker can change without touching callers. Three backends ship:
-// sync (runs inline, no broker), database (jobs table), and redis
-// (list-based). Jobs self-register handlers by name; the queue:work command
-// pops, dispatches, and acks in a loop until its context ends.
+// Package queue provides background jobs behind a selectable backend
+// (sync/database/redis). Handlers self-register by name via init().
 package queue
 
 import (
@@ -22,8 +19,7 @@ import (
 // from transient backend errors.
 var ErrJobBuried = errors.New("queue: job buried after max attempts")
 
-// Job is one unit of background work. Payload is opaque JSON by
-// convention; Attempts counts pops including the current one.
+// Job is one unit of background work (opaque JSON payload).
 type Job struct {
 	ID          string
 	Name        string
@@ -32,33 +28,25 @@ type Job struct {
 	AvailableAt time.Time
 }
 
-// Handler runs a job. A nil error means success (ack); any other error
-// means failure (retry with backoff, bury past max attempts).
+// Handler runs a job: nil error acks, any other error retries then buries.
 type Handler func(ctx context.Context, job Job) error
 
-// Registry maps job names to handlers. Register at init() in your jobs
-// package; the queue:work command blank-imports it so handlers attach with no
-// manual wiring.
 type Registry struct {
 	mu       sync.RWMutex
 	handlers map[string]Handler
 }
 
-// NewRegistry returns an empty handler registry.
 func NewRegistry() *Registry {
 	return &Registry{handlers: map[string]Handler{}}
 }
 
-// Handle registers h for name, replacing any previous handler.
 func (r *Registry) Handle(name string, h Handler) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.handlers[name] = h
 }
 
-// Lookup returns the handler for name, or false when none is registered.
-// Unknown job names are buried, never retried: retrying code that does
-// not exist can only poison the queue.
+// Lookup returns the handler for name. Unknown names are buried, never retried.
 func (r *Registry) Lookup(name string) (Handler, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -68,19 +56,15 @@ func (r *Registry) Lookup(name string) (Handler, bool) {
 
 var defaultRegistry = NewRegistry()
 
-// Handle registers h on the default registry. Call it from init() in
-// internal/jobs (or your own jobs package) to attach handlers without
-// touching the worker command.
+// Handle registers h on the default registry (call from init()).
 func Handle(name string, h Handler) {
 	defaultRegistry.Handle(name, h)
 }
 
-// Default returns the default handler registry.
 func Default() *Registry { return defaultRegistry }
 
-// Queue is the broker contract. Reserve returns the next available job;
-// ok=false means empty (not an error). Ack marks success; Fail requeues
-// with backoff or buries past max attempts (returning ErrJobBuried).
+// Queue is the broker contract: Reserve pops, Ack completes, Fail requeues
+// with backoff or buries past max attempts.
 type Queue interface {
 	Push(ctx context.Context, name string, payload []byte) (string, error)
 	Reserve(ctx context.Context) (Job, bool, error)
@@ -88,29 +72,27 @@ type Queue interface {
 	Fail(ctx context.Context, job Job, jobErr error) error
 }
 
-// Open returns the configured queue backend. Missing handles fail fast: a
-// worker that cannot reach its broker must not silently run inline instead.
-func Open(cfg config.Queue, db *gorm.DB, rdb *redis.Client) (Queue, error) {
-	switch cfg.Connection {
+// Open returns the configured backend (missing handles fail fast, never inline).
+func Open(config config.Queue, db *gorm.DB, rdb *redis.Client) (Queue, error) {
+	switch config.Connection {
 	case "", "sync":
 		return NewSync(), nil
 	case "redis":
 		if rdb == nil {
 			return nil, fmt.Errorf("queue: redis backend needs a reachable client")
 		}
-		return NewRedis(rdb, "", cfg.Tries), nil
+		return NewRedis(rdb, "", config.Tries), nil
 	case "database":
 		if db == nil {
 			return nil, fmt.Errorf("queue: database backend needs a *gorm.DB")
 		}
-		return NewDatabase(db, cfg.Tries), nil
+		return NewDatabase(db, config.Tries), nil
 	default:
-		return nil, fmt.Errorf("queue: unsupported connection %q", cfg.Connection)
+		return nil, fmt.Errorf("queue: unsupported connection %q", config.Connection)
 	}
 }
 
-// backoff delays the next attempt exponentially from 30s, capped at 1h,
-// so a failing job retries without hammering the backend.
+// backoff delays retries exponentially from 30s, capped at 1h.
 func backoff(attempts int) time.Duration {
 	if attempts < 1 {
 		attempts = 1
@@ -122,6 +104,5 @@ func backoff(attempts int) time.Duration {
 	return d
 }
 
-// retryDelay is the backoff policy, extracted as a variable so tests run
-// retries with zero delay instead of waiting out real backoffs.
+// retryDelay is a var so tests run retries with zero delay.
 var retryDelay = backoff

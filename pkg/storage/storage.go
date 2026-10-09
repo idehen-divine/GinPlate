@@ -1,10 +1,5 @@
-// Package storage provides file storage behind a small interface so the
-// disk driver can change without touching callers. Three disks ship:
-//
-//	local  - private files under Filesystem.Root, no public URLs.
-//	public - local files under Filesystem.PublicRoot, served at PublicURL.
-//	s3     - object storage via the AWS SDK v2 (or S3-compatible stores
-//	         with path-style addressing, e.g. MinIO).
+// Package storage provides file storage behind a driver interface
+// (local/public/s3).
 package storage
 
 import (
@@ -16,13 +11,11 @@ import (
 	"github.com/idehen-divine/GinPlate/pkg/config"
 )
 
-// ErrNotFound reports a missing file. Drivers translate native
-// not-exists conditions into it so callers branch portably.
+// ErrNotFound reports a missing file.
 var ErrNotFound = errors.New("storage: file not found")
 
-// Storage is the file-store contract: put/get/delete/exists addressed by
-// relative path (e.g. "avatars/ada.png"). Paths are always scoped to the
-// driver's root; absolute paths and ".." escapes are rejected.
+// Storage is the file-store contract, addressed by relative path. Absolute
+// paths and ".." escapes are rejected.
 type Storage interface {
 	Put(ctx context.Context, path string, r io.Reader) error
 	Get(ctx context.Context, path string) (io.ReadCloser, error)
@@ -30,14 +23,10 @@ type Storage interface {
 	Exists(ctx context.Context, path string) (bool, error)
 }
 
-// URLer is implemented by disks that can hand out a download URL
-// (public files, presigned S3 links). The private local disk does not.
 type URLer interface {
 	URL(ctx context.Context, path string) (string, error)
 }
 
-// Open returns the configured disk driver. Unknown drivers fail fast so a
-// typo in FILESYSTEM_DISK surfaces at startup, not on first upload.
 func Open(cfg config.Filesystem) (Storage, error) {
 	switch cfg.Disk {
 	case "", "local":

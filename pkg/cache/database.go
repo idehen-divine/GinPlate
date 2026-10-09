@@ -8,8 +8,6 @@ import (
 	"gorm.io/gorm"
 )
 
-// cacheRow maps the caches migration table. Expiry is absolute UTC;
-// NULL expires_at means the row lives forever.
 type cacheRow struct {
 	Key       string     `gorm:"column:cache_key;primaryKey;size:255"`
 	Value     []byte     `gorm:"type:text;not null"`
@@ -18,19 +16,16 @@ type cacheRow struct {
 
 func (cacheRow) TableName() string { return "caches" }
 
-// databaseStore is a Store backed by the caches table.
 type databaseStore struct {
 	db     *gorm.DB
 	prefix string
 	now    func() time.Time
 }
 
-// NewDatabase returns a DB-backed Store namespaced by prefix.
 func NewDatabase(db *gorm.DB, prefix string) Store {
 	return &databaseStore{db: db, prefix: prefix, now: time.Now}
 }
 
-// Get returns the value, treating expired rows as missing (and dropping them).
 func (s *databaseStore) Get(ctx context.Context, key string) ([]byte, bool, error) {
 	var row cacheRow
 	err := s.db.WithContext(ctx).Where("cache_key = ?", s.prefix+key).First(&row).Error
@@ -47,8 +42,7 @@ func (s *databaseStore) Get(ctx context.Context, key string) ([]byte, bool, erro
 	return row.Value, true, nil
 }
 
-// Set upserts the value; ttl <= 0 means no expiry. Expired rows are swept
-// opportunistically so the table stays small without a cron job.
+// Set upserts the value, sweeping expired rows opportunistically.
 func (s *databaseStore) Set(ctx context.Context, key string, val []byte, ttl time.Duration) error {
 	var exp *time.Time
 	if ttl > 0 {
@@ -62,7 +56,6 @@ func (s *databaseStore) Set(ctx context.Context, key string, val []byte, ttl tim
 	return s.db.WithContext(ctx).Save(&cacheRow{Key: full, Value: val, ExpiresAt: exp}).Error
 }
 
-// Delete removes keys; missing keys are not an error.
 func (s *databaseStore) Delete(ctx context.Context, keys ...string) error {
 	if len(keys) == 0 {
 		return nil
@@ -74,7 +67,6 @@ func (s *databaseStore) Delete(ctx context.Context, keys ...string) error {
 	return s.db.WithContext(ctx).Where("cache_key IN ?", full).Delete(&cacheRow{}).Error
 }
 
-// Exists reports whether key is present and unexpired.
 func (s *databaseStore) Exists(ctx context.Context, key string) (bool, error) {
 	var n int64
 	err := s.db.WithContext(ctx).Model(&cacheRow{}).

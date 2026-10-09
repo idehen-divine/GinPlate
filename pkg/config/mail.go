@@ -4,11 +4,7 @@ import (
 	"github.com/spf13/viper"
 )
 
-// Mail holds outgoing mail settings, delivered by pkg/mail.
-//
-// Supported MAIL_MAILER values: "log" (dev/test default, writes to logs),
-// "smtp" (real delivery via MAIL_HOST/PORT/USERNAME/PASSWORD/ENCRYPTION),
-// "ses" (AWS SESv2 raw send, reusing the standard AWS_* credential chain).
+// Mail holds outgoing mail settings (mailer: log/smtp/ses).
 type Mail struct {
 	Mailer   string `mapstructure:"MAIL_MAILER"`
 	Host     string `mapstructure:"MAIL_HOST"`

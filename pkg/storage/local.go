@@ -9,16 +9,11 @@ import (
 	"strings"
 )
 
-// localDisk stores files on the local filesystem under root. An empty
-// urlBase means private (URL reports an error); otherwise files are
-// addressed as urlBase + "/" + path.
 type localDisk struct {
 	root    string
 	urlBase string
 }
 
-// NewLocal opens the local disk rooted at dir, created on demand.
-// urlBase attaches public addressing; pass "" for a private disk.
 func NewLocal(dir, urlBase string) (Storage, error) {
 	abs, err := filepath.Abs(dir)
 	if err != nil {
@@ -30,10 +25,8 @@ func NewLocal(dir, urlBase string) (Storage, error) {
 	return &localDisk{root: abs, urlBase: strings.TrimSuffix(urlBase, "/")}, nil
 }
 
-// resolve maps a relative path into the root, rejecting absolute paths
-// and ".." escapes so callers can never leave the disk. It also resolves
-// symlinks (EvalSymlinks) and re-checks containment, so a symlink planted
-// beneath the root cannot redirect reads/writes outside it.
+// resolve maps a relative path into the root, rejecting escapes and
+// symlink redirections outside it.
 func (d *localDisk) resolve(path string) (string, error) {
 	if path == "" || filepath.IsAbs(path) {
 		return "", fmt.Errorf("storage: invalid path %q", path)
@@ -71,7 +64,6 @@ func (d *localDisk) resolve(path string) (string, error) {
 	return full, nil
 }
 
-// Put writes r to path, creating parent directories as needed.
 func (d *localDisk) Put(ctx context.Context, path string, r io.Reader) error {
 	full, err := d.resolve(path)
 	if err != nil {
@@ -89,7 +81,6 @@ func (d *localDisk) Put(ctx context.Context, path string, r io.Reader) error {
 	return err
 }
 
-// Get opens path for reading, or ErrNotFound when missing.
 func (d *localDisk) Get(_ context.Context, path string) (io.ReadCloser, error) {
 	full, err := d.resolve(path)
 	if err != nil {
@@ -105,7 +96,6 @@ func (d *localDisk) Get(_ context.Context, path string) (io.ReadCloser, error) {
 	return f, nil
 }
 
-// Delete removes path. A missing file is success.
 func (d *localDisk) Delete(_ context.Context, path string) error {
 	full, err := d.resolve(path)
 	if err != nil {
@@ -117,7 +107,6 @@ func (d *localDisk) Delete(_ context.Context, path string) error {
 	return nil
 }
 
-// Exists reports whether path is a regular file on the disk.
 func (d *localDisk) Exists(_ context.Context, path string) (bool, error) {
 	full, err := d.resolve(path)
 	if err != nil {
@@ -133,8 +122,6 @@ func (d *localDisk) Exists(_ context.Context, path string) (bool, error) {
 	return !st.IsDir(), nil
 }
 
-// URL addresses path under the public base URL. Private disks (empty base)
-// have no URL to give.
 func (d *localDisk) URL(_ context.Context, path string) (string, error) {
 	if d.urlBase == "" {
 		return "", fmt.Errorf("storage: no public URL for a private disk")

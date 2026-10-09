@@ -8,18 +8,13 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// redisStore is a Store backed by a shared Redis client using the
-// session:{accessJti} -> refreshJti and refresh:{refreshJti} -> accessJti
-// key scheme. Either half locates the other half for destruction.
 type redisStore struct {
 	rdb *redis.Client
 }
 
-// Redis returns a Redis-backed Store over an existing client.
 func Redis(rdb *redis.Client) Store { return &redisStore{rdb: rdb} }
 
-// Link records both halves with their TTLs. If the second write fails the
-// first is rolled back so a partial session can never validate.
+// Link records both halves, rolling back the first write on failure.
 func (s *redisStore) Link(ctx context.Context, accessJti, refreshJti, _ string, accessTTL, refreshTTL time.Duration) error {
 	if accessJti == "" || refreshJti == "" {
 		return errEmptySessionID
@@ -34,7 +29,6 @@ func (s *redisStore) Link(ctx context.Context, accessJti, refreshJti, _ string, 
 	return nil
 }
 
-// AccessValid returns the linked refresh jti, or "" when unknown/expired.
 func (s *redisStore) AccessValid(ctx context.Context, accessJti string) (string, bool) {
 	if accessJti == "" {
 		return "", false
@@ -46,7 +40,6 @@ func (s *redisStore) AccessValid(ctx context.Context, accessJti string) (string,
 	return rjti, true
 }
 
-// RefreshValid returns the linked access jti, or "" when unknown/expired.
 func (s *redisStore) RefreshValid(ctx context.Context, refreshJti string) (string, bool) {
 	if refreshJti == "" {
 		return "", false
@@ -58,8 +51,6 @@ func (s *redisStore) RefreshValid(ctx context.Context, refreshJti string) (strin
 	return ajti, true
 }
 
-// consumeRefreshScript atomically returns the linked access jti and deletes
-// both halves, so exactly one concurrent refresh consumer wins.
 var consumeRefreshScript = redis.NewScript(`
 local a = redis.call("GET", "refresh:" .. ARGV[1])
 if not a then return nil end
@@ -68,8 +59,6 @@ redis.call("DEL", "session:" .. a)
 return a
 `)
 
-// ttlSeconds converts a TTL to whole Redis seconds, flooring at 1 so
-// sub-second test TTLs still persist instead of expiring immediately.
 func ttlSeconds(d time.Duration) int64 {
 	if s := int64(d / time.Second); s > 1 {
 		return s
@@ -77,10 +66,6 @@ func ttlSeconds(d time.Duration) int64 {
 	return 1
 }
 
-// replaceRefreshScript atomically verifies the old refresh half, deletes
-// both old halves, and records both new halves. Redis executes scripts
-// atomically, so concurrent rotations of the same refresh token cannot both
-// succeed: exactly one caller observes the old key.
 var replaceRefreshScript = redis.NewScript(`
 local a = redis.call("GET", "refresh:" .. ARGV[1])
 if not a then return nil end
@@ -91,7 +76,6 @@ redis.call("SET", "refresh:" .. ARGV[3], ARGV[2], "EX", ARGV[5])
 return a
 `)
 
-// ReplaceRefresh atomically rotates the session to the replacement halves.
 func (s *redisStore) ReplaceRefresh(ctx context.Context, oldRefreshJti, newAccessJti, newRefreshJti, _ string, accessTTL, refreshTTL time.Duration) (string, bool, error) {
 	if oldRefreshJti == "" || newAccessJti == "" || newRefreshJti == "" {
 		return "", false, errEmptySessionID
@@ -111,7 +95,6 @@ func (s *redisStore) ReplaceRefresh(ctx context.Context, oldRefreshJti, newAcces
 	return ajti, true, nil
 }
 
-// ConsumeRefresh atomically validates and deletes the refresh half.
 func (s *redisStore) ConsumeRefresh(ctx context.Context, refreshJti string) (string, bool, error) {
 	if refreshJti == "" {
 		return "", false, nil
@@ -130,7 +113,6 @@ func (s *redisStore) ConsumeRefresh(ctx context.Context, refreshJti string) (str
 	return ajti, true, nil
 }
 
-// Unlink destroys both halves. Missing keys are not errors.
 func (s *redisStore) Unlink(ctx context.Context, accessJti, refreshJti string) error {
 	keys := make([]string, 0, 2)
 	if accessJti != "" {

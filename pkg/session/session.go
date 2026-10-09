@@ -1,9 +1,6 @@
-// Package session tracks login sessions behind a driver-selected Store,
-// so Redis is one backend among equals instead of a hardcoded dependency.
-// Three drivers ship: redis (shared client), database (sessions table),
-// and file (one JSON file per session, development-only). Construction is
-// fail-closed: requesting redis without a reachable client is an error,
-// never a silent downgrade to untracked tokens.
+// Package session tracks login sessions behind a driver-selected Store
+// (redis, database, file). Construction is fail-closed: no reachable
+// backend is an error, never a silent downgrade to untracked tokens.
 package session
 
 import (
@@ -16,25 +13,15 @@ import (
 	"gorm.io/gorm"
 )
 
-// errEmptySessionID rejects empty JTIs so callers cannot link sessions that
-// can never be addressed or revoked.
 var errEmptySessionID = errors.New("session: empty session id")
 
-// Store records linked access+refresh session halves. Lookups fail closed:
-// unknown, expired, or unreadable halves report ok=false, so callers treat
-// backend outages like revocations. Link failures must fail authentication;
-// callers must not ignore them. ConsumeRefresh atomically validates and
-// deletes the refresh half for one-way invalidation. Callers performing
-// refresh rotation must use ReplaceRefresh, never consume-then-link: only
-// the atomic form guarantees a failed replacement cannot strand the user
-// with no session. Storage errors are returned so callers can distinguish
-// outage (500) from replay (401).
+// Store records linked access+refresh session halves. Lookups fail closed
+// (unknown/expired/unreadable → ok=false); link failures must fail
+// authentication. Refresh rotation must use ReplaceRefresh, never
+// consume-then-link, or a failed replacement strands the user sessionless.
 type Store interface {
-	// Link records both halves of a session with their TTLs.
 	Link(ctx context.Context, accessJti, refreshJti, userID string, accessTTL, refreshTTL time.Duration) error
-	// AccessValid returns the linked refresh jti for a live access half.
 	AccessValid(ctx context.Context, accessJti string) (refreshJti string, ok bool)
-	// RefreshValid returns the linked access jti for a live refresh half.
 	RefreshValid(ctx context.Context, refreshJti string) (accessJti string, ok bool)
 	// ConsumeRefresh atomically validates the refresh half and deletes the
 	// whole session, returning the linked access jti. It is for one-way
@@ -54,10 +41,8 @@ type Store interface {
 	Unlink(ctx context.Context, accessJti, refreshJti string) error
 }
 
-// Open selects the session driver. Unknown drivers fail fast at startup.
-// A redis selection without a client is a construction error: a nil store
-// would silently disable logout and revocation, so callers must supply a
-// reachable client instead of booting untracked.
+// Open selects the session driver (unknown drivers fail fast; redis without
+// a reachable client is a construction error, never untracked).
 func Open(driver string, db *gorm.DB, rdb *redis.Client, dir string) (Store, error) {
 	switch driver {
 	case "", "file":

@@ -4,12 +4,9 @@ import (
 	"github.com/spf13/viper"
 )
 
-// Logging holds log verbosity and output.
 type Logging struct {
-	// Level is debug, info, warn, or error.
 	Level string `mapstructure:"LOG_LEVEL"`
-	// Output is the log directory holding YYYY-MM-DD.logs daily files
-	// (retained 7 days). Empty means stdout only.
+	// Output is the log directory (daily files, 7-day retention); empty means stdout only.
 	Output string `mapstructure:"LOG_OUTPUT"`
 }
 

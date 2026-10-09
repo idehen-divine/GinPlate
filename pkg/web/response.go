@@ -8,22 +8,16 @@ import (
 	"github.com/go-playground/validator/v10"
 )
 
-// debug exposes error internals to API clients. It defaults to false
-// (production-safe) and is enabled by the application when APP_DEBUG is
-// true. 4xx payloads always show; 5xx payloads only show when debug.
+// debugMode gates 5xx error detail (4xx always show). Set from APP_DEBUG.
 var debugMode = false
 
-// SetDebug toggles client-facing error detail. Call once at startup from
-// the APP_DEBUG config value.
+// SetDebug toggles client-facing error detail. Call once at startup.
 func SetDebug(v bool) { debugMode = v }
 
 // IsDebug reports whether client-facing error detail is enabled.
 func IsDebug() bool { return debugMode }
 
-// Success responds with the standard API success shape. All five keys are
-// always present (mirroring the Laravel frontend contract): success, code
-// (mirrors the HTTP status), message, data, and errors (null on success).
-// A nil data becomes an empty list so collections never serialize as null.
+// Success responds with the standard envelope. Nil data becomes an empty list.
 func Success(c *gin.Context, status int, message string, data interface{}) {
 	if data == nil {
 		data = []interface{}{}
@@ -31,11 +25,8 @@ func Success(c *gin.Context, status int, message string, data interface{}) {
 	c.JSON(status, gin.H{"success": true, "code": status, "message": message, "data": data, "errors": nil})
 }
 
-// Fail responds with the standard API error shape: success false, the code
-// mirroring the HTTP status, data always null, and errors carrying the
-// payload. The errs payload is included on 4xx responses (user-actionable)
-// and on 5xx only when debug is enabled; production 5xx responses carry
-// the message alone.
+// Fail responds with the error envelope. errs shows on 4xx, and on 5xx
+// only when debug is enabled.
 func Fail(c *gin.Context, status int, message string, errs interface{}) {
 	body := gin.H{"success": false, "code": status, "message": message, "data": nil}
 	if errs != nil && (status < 500 || debugMode) {

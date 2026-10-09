@@ -8,10 +8,6 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// NewClient opens a Redis client for the given address, ACL identity, and
-// logical database. Empty username means no ACL auth; DB 0 is the default
-// index. The caller owns session keys; a nil client disables session
-// tracking.
 func NewClient(addr, username, password string, db int) *redis.Client {
 	return redis.NewClient(&redis.Options{
 		Addr:     addr,
@@ -21,11 +17,10 @@ func NewClient(addr, username, password string, db int) *redis.Client {
 	})
 }
 
-// DialOrNil pings Redis and returns nil when it is unreachable, so the app
-// boots and serves without it (tokens validate by signature, logout becomes
-// a no-op). Callers must already tolerate a nil client.
-func DialOrNil(cfg config.Redis, timeout time.Duration) *redis.Client {
-	c := NewClient(cfg.Addr(), cfg.User, cfg.Pass, cfg.DB)
+// DialOrNil pings Redis, returning nil when unreachable. Callers must
+// tolerate a nil client.
+func DialOrNil(config config.Redis, timeout time.Duration) *redis.Client {
+	c := NewClient(config.Addr(), config.User, config.Pass, config.DB)
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	if err := c.Ping(ctx).Err(); err != nil {

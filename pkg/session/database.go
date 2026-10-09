@@ -9,9 +9,6 @@ import (
 	"gorm.io/gorm/clause"
 )
 
-// sessionRow maps the sessions migration table. The id holds the access
-// jti and refresh_jti the linked refresh jti; absolute expiries replace
-// Redis TTLs with identical semantics.
 type sessionRow struct {
 	ID               string    `gorm:"primaryKey;size:36"`
 	RefreshJTI       string    `gorm:"column:refresh_jti;size:36;uniqueIndex;not null"`
@@ -22,19 +19,17 @@ type sessionRow struct {
 
 func (sessionRow) TableName() string { return "sessions" }
 
-// databaseStore is a Store backed by the sessions table. Every write also
-// deletes already-expired rows, so the table stays small without a cron job.
+// databaseStore is a Store backed by the sessions table (expired rows pruned
+// on every write, so no cron job is needed).
 type databaseStore struct {
 	db  *gorm.DB
 	now func() time.Time
 }
 
-// Database returns a DB-backed Store.
 func Database(db *gorm.DB) Store {
 	return &databaseStore{db: db, now: time.Now}
 }
 
-// Link inserts (or replaces) the session row with absolute expiries.
 func (s *databaseStore) Link(ctx context.Context, accessJti, refreshJti, userID string, accessTTL, refreshTTL time.Duration) error {
 	if accessJti == "" || refreshJti == "" {
 		return errEmptySessionID
@@ -55,7 +50,6 @@ func (s *databaseStore) Link(ctx context.Context, accessJti, refreshJti, userID 
 		Delete(&sessionRow{}).Error
 }
 
-// AccessValid returns the linked refresh jti for a live access half.
 func (s *databaseStore) AccessValid(ctx context.Context, accessJti string) (string, bool) {
 	if accessJti == "" {
 		return "", false
@@ -71,7 +65,6 @@ func (s *databaseStore) AccessValid(ctx context.Context, accessJti string) (stri
 	return row.RefreshJTI, true
 }
 
-// RefreshValid returns the linked access jti for a live refresh half.
 func (s *databaseStore) RefreshValid(ctx context.Context, refreshJti string) (string, bool) {
 	if refreshJti == "" {
 		return "", false
@@ -87,12 +80,8 @@ func (s *databaseStore) RefreshValid(ctx context.Context, refreshJti string) (st
 	return row.ID, true
 }
 
-// ReplaceRefresh validates the old refresh half and records the
-// replacement session in one transaction: row lock, old-row deletion
-// (RowsAffected must be 1, else a concurrent rotation won), then new-row
-// insertion. Any failure rolls the transaction back, so the old session
-// survives storage errors and the user can retry instead of being stranded
-// without a session.
+// ReplaceRefresh validates and replaces in one transaction (RowsAffected
+// must be 1, else a concurrent rotation won; failures roll back).
 func (s *databaseStore) ReplaceRefresh(ctx context.Context, oldRefreshJti, newAccessJti, newRefreshJti, userID string, accessTTL, refreshTTL time.Duration) (string, bool, error) {
 	if oldRefreshJti == "" || newAccessJti == "" || newRefreshJti == "" {
 		return "", false, errEmptySessionID
@@ -110,17 +99,17 @@ func (s *databaseStore) ReplaceRefresh(ctx context.Context, oldRefreshJti, newAc
 			return err
 		}
 		if !now.Before(row.RefreshExpiresAt) {
-			res := tx.Where("refresh_jti = ?", oldRefreshJti).Delete(&sessionRow{})
-			if res.Error != nil {
-				return res.Error
+			result := tx.Where("refresh_jti = ?", oldRefreshJti).Delete(&sessionRow{})
+			if result.Error != nil {
+				return result.Error
 			}
 			return nil // expired: reaped, replay either way
 		}
-		res := tx.Where("refresh_jti = ?", oldRefreshJti).Delete(&sessionRow{})
-		if res.Error != nil {
-			return res.Error
+		result := tx.Where("refresh_jti = ?", oldRefreshJti).Delete(&sessionRow{})
+		if result.Error != nil {
+			return result.Error
 		}
-		if res.RowsAffected == 0 {
+		if result.RowsAffected == 0 {
 			return nil // racer already consumed it: replay
 		}
 		next := sessionRow{
@@ -143,12 +132,8 @@ func (s *databaseStore) ReplaceRefresh(ctx context.Context, oldRefreshJti, newAc
 	return oldAccessJti, replaced, nil
 }
 
-// ConsumeRefresh validates the refresh half and deletes the session row in
-// one transaction, so concurrent refresh requests cannot both succeed. The
-// row is locked with SELECT ... FOR UPDATE and the DELETE must affect
-// exactly one row: RowsAffected == 0 means a concurrent consumer already
-// deleted it, which is reported as replay (ok=false), not success.
-// Expired rows are reaped and likewise reported as replay.
+// ConsumeRefresh validates and deletes in one transaction (concurrent
+// consumers report replay, not success).
 func (s *databaseStore) ConsumeRefresh(ctx context.Context, refreshJti string) (string, bool, error) {
 	if refreshJti == "" {
 		return "", false, nil
@@ -165,20 +150,20 @@ func (s *databaseStore) ConsumeRefresh(ctx context.Context, refreshJti string) (
 			return err
 		}
 		if !s.now().Before(row.RefreshExpiresAt) {
-			res := tx.Where("refresh_jti = ?", refreshJti).Delete(&sessionRow{})
-			if res.Error != nil {
-				return res.Error
+			result := tx.Where("refresh_jti = ?", refreshJti).Delete(&sessionRow{})
+			if result.Error != nil {
+				return result.Error
 			}
-			if res.RowsAffected == 0 {
+			if result.RowsAffected == 0 {
 				return nil // racer already reaped it: replay
 			}
 			return nil
 		}
-		res := tx.Where("refresh_jti = ?", refreshJti).Delete(&sessionRow{})
-		if res.Error != nil {
-			return res.Error
+		result := tx.Where("refresh_jti = ?", refreshJti).Delete(&sessionRow{})
+		if result.Error != nil {
+			return result.Error
 		}
-		if res.RowsAffected == 0 {
+		if result.RowsAffected == 0 {
 			return nil // racer already consumed it: replay
 		}
 		accessJti = row.ID
@@ -191,7 +176,6 @@ func (s *databaseStore) ConsumeRefresh(ctx context.Context, refreshJti string) (
 	return accessJti, consumed, nil
 }
 
-// Unlink destroys the session row by either half. Missing rows are not errors.
 func (s *databaseStore) Unlink(ctx context.Context, accessJti, refreshJti string) error {
 	return s.db.WithContext(ctx).
 		Where("id = ? OR refresh_jti = ?", accessJti, refreshJti).
